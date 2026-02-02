@@ -68,14 +68,17 @@ class TestTextSearchPerformance:
             db_path=temp_db
         )
 
-        start = time.time()
-        index.fit(large_docs)
-        fit_time = time.time() - start
+        try:
+            start = time.time()
+            index.fit(large_docs)
+            fit_time = time.time() - start
 
-        print(f"\nFit 10,000 documents in {fit_time:.2f} seconds")
+            print(f"\nFit 10,000 documents in {fit_time:.2f} seconds")
 
-        # Should complete in reasonable time (< 30 seconds)
-        assert fit_time < 30.0
+            # Should complete in reasonable time (< 30 seconds)
+            assert fit_time < 30.0
+        finally:
+            index.close()
 
     def test_search_10000_documents(self, large_docs, temp_db):
         """Test searching over 10,000 documents."""
@@ -86,20 +89,23 @@ class TestTextSearchPerformance:
         )
         index.fit(large_docs)
 
-        # Test various searches
-        queries = ["python tutorial", "javascript example", "rust reference", "go news"]
+        try:
+            # Test various searches
+            queries = ["python tutorial", "javascript example", "rust reference", "go news"]
 
-        for query in queries:
-            start = time.time()
-            results = index.search(query, num_results=10)
-            search_time = time.time() - start
+            for query in queries:
+                start = time.time()
+                results = index.search(query, num_results=10)
+                search_time = time.time() - start
 
-            print(f"Search '{query}' returned {len(results)} results in {search_time:.4f} seconds")
+                print(f"Search '{query}' returned {len(results)} results in {search_time:.4f} seconds")
 
-            # Should return results quickly (< 1 second)
-            assert search_time < 1.0
-            assert len(results) <= 10
-            assert len(results) > 0
+                # Should return results quickly (< 1 second)
+                assert search_time < 1.0
+                assert len(results) <= 10
+                assert len(results) > 0
+        finally:
+            index.close()
 
     def test_search_with_filter_10000_documents(self, large_docs, temp_db):
         """Test searching with filters over 10,000 documents."""
@@ -110,19 +116,22 @@ class TestTextSearchPerformance:
         )
         index.fit(large_docs)
 
-        start = time.time()
-        results = index.search(
-            "python",
-            filter_dict={"category": "tutorial"},
-            num_results=5
-        )
-        search_time = time.time() - start
+        try:
+            start = time.time()
+            results = index.search(
+                "python",
+                filter_dict={"category": "tutorial"},
+                num_results=5
+            )
+            search_time = time.time() - start
 
-        print(f"\nFiltered search returned {len(results)} results in {search_time:.4f} seconds")
+            print(f"\nFiltered search returned {len(results)} results in {search_time:.4f} seconds")
 
-        # All results should be python tutorials
-        for result in results:
-            assert result["category"] == "tutorial"
+            # All results should be python tutorials
+            for result in results:
+                assert result["category"] == "tutorial"
+        finally:
+            index.close()
 
     def test_add_to_10000_documents(self, large_docs, temp_db):
         """Test adding documents to an index of 10,000."""
@@ -132,30 +141,33 @@ class TestTextSearchPerformance:
             db_path=temp_db
         )
 
-        # Fit initial 10,000
-        index.fit(large_docs)
+        try:
+            # Fit initial 10,000
+            index.fit(large_docs)
 
-        # Add 100 more documents
-        new_docs = [
-            {
-                "id": 10000 + i,
-                "title": f"New Document {i}",
-                "description": f"A newly added document about python",
-                "topic": "python",
-            }
-            for i in range(100)
-        ]
+            # Add 100 more documents
+            new_docs = [
+                {
+                    "id": 10000 + i,
+                    "title": f"New Document {i}",
+                    "description": f"A newly added document about python",
+                    "topic": "python",
+                }
+                for i in range(100)
+            ]
 
-        start = time.time()
-        for doc in new_docs:
-            index.add(doc)
-        add_time = time.time() - start
+            start = time.time()
+            for doc in new_docs:
+                index.add(doc)
+            add_time = time.time() - start
 
-        print(f"\nAdded 100 documents in {add_time:.2f} seconds")
+            print(f"\nAdded 100 documents in {add_time:.2f} seconds")
 
-        # Search should find the new documents
-        results = index.search("New Document", num_results=10)
-        assert len(results) > 0
+            # Search should find the new documents
+            results = index.search("New Document", num_results=10)
+            assert len(results) > 0
+        finally:
+            index.close()
 
     def test_persistence_10000_documents(self, large_docs, temp_db):
         """Test that 10,000 documents persist correctly."""
@@ -175,9 +187,12 @@ class TestTextSearchPerformance:
             db_path=temp_db
         )
 
-        results = index2.search("python", num_results=10)
-        assert len(results) > 0
-        assert len(results) <= 10
+        try:
+            results = index2.search("python", num_results=10)
+            assert len(results) > 0
+            assert len(results) <= 10
+        finally:
+            index2.close()
 
 
 class TestVectorSearchPerformance:
@@ -192,14 +207,17 @@ class TestVectorSearchPerformance:
             db_path=temp_db
         )
 
-        start = time.time()
-        index.fit(large_vectors, large_docs)
-        fit_time = time.time() - start
+        try:
+            start = time.time()
+            index.fit(large_vectors, large_docs)
+            fit_time = time.time() - start
 
-        print(f"\nFit 10,000 vectors (1024-dim) in {fit_time:.2f} seconds")
+            print(f"\nFit 10,000 vectors (1024-dim) in {fit_time:.2f} seconds")
 
-        # Should complete in reasonable time
-        assert fit_time < 120.0
+            # Should complete in reasonable time
+            assert fit_time < 120.0
+        finally:
+            index.close()
 
     def test_search_10000_vectors(self, large_vectors, large_docs, temp_db):
         """Test searching over 10,000 vectors."""
@@ -211,20 +229,23 @@ class TestVectorSearchPerformance:
         )
         index.fit(large_vectors, large_docs)
 
-        # Use first vector as query (should return itself as top result)
-        query_vector = large_vectors[0]
+        try:
+            # Use first vector as query (should return itself as top result)
+            query_vector = large_vectors[0]
 
-        start = time.time()
-        results = index.search(query_vector, num_results=10)
-        search_time = time.time() - start
+            start = time.time()
+            results = index.search(query_vector, num_results=10)
+            search_time = time.time() - start
 
-        print(f"Search returned {len(results)} results in {search_time:.4f} seconds")
+            print(f"Search returned {len(results)} results in {search_time:.4f} seconds")
 
-        # Should return results quickly
-        assert search_time < 1.0
-        assert len(results) <= 10
-        # First result should be the query vector itself
-        assert results[0]["id"] == 0
+            # Should return results quickly
+            assert search_time < 1.0
+            assert len(results) <= 10
+            # First result should be the query vector itself
+            assert results[0]["id"] == 0
+        finally:
+            index.close()
 
     def test_search_multiple_queries_10000_vectors(self, large_vectors, large_docs, temp_db):
         """Test multiple searches over 10,000 vectors."""
@@ -236,24 +257,27 @@ class TestVectorSearchPerformance:
         )
         index.fit(large_vectors, large_docs)
 
-        # Test 10 random queries
-        rng = np.random.default_rng(123)
-        total_time = 0.0
+        try:
+            # Test 10 random queries
+            rng = np.random.default_rng(123)
+            total_time = 0.0
 
-        for i in range(10):
-            query_idx = rng.integers(0, 10000)
-            query_vector = large_vectors[query_idx]
+            for i in range(10):
+                query_idx = rng.integers(0, 10000)
+                query_vector = large_vectors[query_idx]
 
-            start = time.time()
-            results = index.search(query_vector, num_results=5)
-            search_time = time.time() - start
-            total_time += search_time
+                start = time.time()
+                results = index.search(query_vector, num_results=5)
+                search_time = time.time() - start
+                total_time += search_time
 
-        avg_time = total_time / 10
-        print(f"\nAverage search time over 10 queries: {avg_time:.4f} seconds")
+            avg_time = total_time / 10
+            print(f"\nAverage search time over 10 queries: {avg_time:.4f} seconds")
 
-        # Average should be fast
-        assert avg_time < 0.5
+            # Average should be fast
+            assert avg_time < 0.5
+        finally:
+            index.close()
 
     def test_search_with_filter_10000_vectors(self, large_vectors, large_docs, temp_db):
         """Test searching with filters over 10,000 vectors."""
@@ -265,22 +289,25 @@ class TestVectorSearchPerformance:
         )
         index.fit(large_vectors, large_docs)
 
-        query_vector = large_vectors[0]
+        try:
+            query_vector = large_vectors[0]
 
-        # Filter by topic
-        start = time.time()
-        results = index.search(
-            query_vector,
-            filter_dict={"topic": "python"},
-            num_results=5
-        )
-        search_time = time.time() - start
+            # Filter by topic
+            start = time.time()
+            results = index.search(
+                query_vector,
+                filter_dict={"topic": "python"},
+                num_results=5
+            )
+            search_time = time.time() - start
 
-        print(f"\nFiltered vector search returned {len(results)} results in {search_time:.4f} seconds")
+            print(f"\nFiltered vector search returned {len(results)} results in {search_time:.4f} seconds")
 
-        # All results should have topic=python
-        for result in results:
-            assert result["topic"] == "python"
+            # All results should have topic=python
+            for result in results:
+                assert result["topic"] == "python"
+        finally:
+            index.close()
 
     def test_add_to_10000_vectors(self, large_vectors, large_docs, temp_db):
         """Test adding vectors to an index of 10,000."""
@@ -291,31 +318,34 @@ class TestVectorSearchPerformance:
             db_path=temp_db
         )
 
-        # Fit initial 10,000
-        index.fit(large_vectors, large_docs)
+        try:
+            # Fit initial 10,000
+            index.fit(large_vectors, large_docs)
 
-        # Add 100 more vectors
-        new_vectors = np.random.randn(100, 1024).astype(np.float32)
-        new_docs = [
-            {
-                "id": 10000 + i,
-                "title": f"New Vector Doc {i}",
-                "topic": "python",
-            }
-            for i in range(100)
-        ]
+            # Add 100 more vectors
+            new_vectors = np.random.randn(100, 1024).astype(np.float32)
+            new_docs = [
+                {
+                    "id": 10000 + i,
+                    "title": f"New Vector Doc {i}",
+                    "topic": "python",
+                }
+                for i in range(100)
+            ]
 
-        start = time.time()
-        for vec, doc in zip(new_vectors, new_docs):
-            index.add(vec, doc)
-        add_time = time.time() - start
+            start = time.time()
+            for vec, doc in zip(new_vectors, new_docs):
+                index.add(vec, doc)
+            add_time = time.time() - start
 
-        print(f"\nAdded 100 vectors in {add_time:.2f} seconds")
+            print(f"\nAdded 100 vectors in {add_time:.2f} seconds")
 
-        # Search should find the new documents
-        query = new_vectors[0]
-        results = index.search(query, num_results=10)
-        assert len(results) > 0
+            # Search should find the new documents
+            query = new_vectors[0]
+            results = index.search(query, num_results=10)
+            assert len(results) > 0
+        finally:
+            index.close()
 
     def test_persistence_10000_vectors(self, large_vectors, large_docs, temp_db):
         """Test that 10,000 vectors persist correctly."""
@@ -337,10 +367,13 @@ class TestVectorSearchPerformance:
             db_path=temp_db
         )
 
-        query_vector = large_vectors[0]
-        results = index2.search(query_vector, num_results=10)
-        assert len(results) > 0
-        assert results[0]["id"] == 0
+        try:
+            query_vector = large_vectors[0]
+            results = index2.search(query_vector, num_results=10)
+            assert len(results) > 0
+            assert results[0]["id"] == 0
+        finally:
+            index2.close()
 
 
 class TestCombinedPerformance:
@@ -355,13 +388,6 @@ class TestCombinedPerformance:
             db_path=temp_db + "_text.db"
         )
 
-        start = time.time()
-        text_index.fit(large_docs)
-        text_fit_time = time.time() - start
-
-        text_results = text_index.search("python tutorial", num_results=10)
-
-        # Vector search
         vec_index = VectorSearchIndex(
             keyword_fields=["topic"],
             n_tables=8,
@@ -369,17 +395,28 @@ class TestCombinedPerformance:
             db_path=temp_db + "_vector.db"
         )
 
-        start = time.time()
-        vec_index.fit(large_vectors, large_docs)
-        vec_fit_time = time.time() - start
+        try:
+            start = time.time()
+            text_index.fit(large_docs)
+            text_fit_time = time.time() - start
 
-        vec_results = vec_index.search(large_vectors[0], num_results=10)
+            text_results = text_index.search("python tutorial", num_results=10)
 
-        print(f"\n--- Performance Summary for 10,000 documents ---")
-        print(f"Text search fit time: {text_fit_time:.2f}s")
-        print(f"Text search results: {len(text_results)}")
-        print(f"Vector search fit time (1024-dim): {vec_fit_time:.2f}s")
-        print(f"Vector search results: {len(vec_results)}")
+            # Vector search
+            start = time.time()
+            vec_index.fit(large_vectors, large_docs)
+            vec_fit_time = time.time() - start
 
-        assert len(text_results) > 0
-        assert len(vec_results) > 0
+            vec_results = vec_index.search(large_vectors[0], num_results=10)
+
+            print(f"\n--- Performance Summary for 10,000 documents ---")
+            print(f"Text search fit time: {text_fit_time:.2f}s")
+            print(f"Text search results: {len(text_results)}")
+            print(f"Vector search fit time (1024-dim): {vec_fit_time:.2f}s")
+            print(f"Vector search results: {len(vec_results)}")
+
+            assert len(text_results) > 0
+            assert len(vec_results) > 0
+        finally:
+            text_index.close()
+            vec_index.close()
