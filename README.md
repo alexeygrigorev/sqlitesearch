@@ -1,9 +1,13 @@
 # sqlitesearch
 
-A tiny, SQLite-backed search library for small, local projects.
+A tiny, SQLite-backed search library for small, local projects. sqlitesearch is a persistent sibling of [minsearch](https://github.com/alexeygrigorev/minsearch) - same API, but stores data on disk.
 
-sqlitesearch provides persistent text search using SQLite FTS5 and persistent
-vector search using LSH (random projections) with exact reranking.
+
+sqlitesearch provides
+
+- text search using SQLite FTS5 and persistent
+- vector search using LSH (random projections) with exact reranking
+- hybrid search (Todo explain)
 
 It stores the index in a single SQLite file, making it perfect for applications
 that need search functionality without running a separate search server.
@@ -12,14 +16,13 @@ that need search functionality without running a separate search server.
 
 - minsearch - in-memory, for experiments and notebooks
 - sqlitesearch - persistent (SQLite file), for pet projects and prototypes
-- Elasticsearch/Qdrant - production workloads with high traffic
+- Postgres/Elasticsearch/Qdrant/etc - production workloads with high traffic
 
-sqlitesearch is a persistent sibling of [minsearch](https://github.com/alexeygrigorev/minsearch) - same API, but stores data on disk.
 
 ## Installation
 
-```
-pip install sqlitesearch
+```bash
+uv add sqlitesearch
 ```
 
 ## Text Search
@@ -161,7 +164,3 @@ The API is designed to match minsearch for easy migration:
 - `fit(docs)` - Index documents (only if index is empty)
 - `add(doc)` - Add a single document
 - `search(query, filter_dict=None, boost_dict=None, num_results=10)` - Search
-
-## License
-
-MIT
