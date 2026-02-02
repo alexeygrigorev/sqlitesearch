@@ -8,31 +8,13 @@ vector search using LSH (random projections) with exact reranking.
 It stores the index in a single SQLite file, making it perfect for applications
 that need search functionality without running a separate search server.
 
-## Relationship to minsearch
+## When to use
 
-sqlitesearch is a persistent, SQLite-based sibling of [minsearch](https://github.com/alexeygrigorev/minsearch).
+- minsearch - in-memory, for experiments and notebooks
+- sqlitesearch - persistent (SQLite file), for pet projects and prototypes
+- Elasticsearch/Qdrant - production workloads with high traffic
 
-minsearch:
-- in-memory only
-- extremely simple
-- no persistence
-- no vector search
-- great for experiments and notebooks
-
-sqlitesearch:
-- persistent (SQLite file)
-- still simple, still local
-- supports text search (FTS5)
-- supports vector search (LSH + rerank)
-
-Rule of thumb:
-- If everything fits in memory and you don't need persistence -> minsearch
-- If you want persistence but still zero infrastructure -> sqlitesearch
-
-sqlitesearch is not a replacement for production search engines like Elasticsearch,
-OpenSearch, or Qdrant. It's designed for pet projects, demos, prototypes, and
-course projects where you want real search functionality without running any
-external services.
+sqlitesearch is a persistent sibling of [minsearch](https://github.com/alexeygrigorev/minsearch) - same API, but stores data on disk.
 
 ## Installation
 
