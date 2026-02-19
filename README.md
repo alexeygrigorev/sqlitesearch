@@ -6,10 +6,10 @@ A tiny, SQLite-backed search library for small, local projects. sqlitesearch is 
 
 sqlitesearch provides:
 
-- **Text search** using SQLite FTS5 with BM25 ranking
-- **Vector search** using LSH (random projections) with exact cosine similarity reranking
-- **Hybrid search** by combining text and vector results
-- **Single-file storage** - everything in one `.db` file
+- Text search using SQLite FTS5 with BM25 ranking
+- Vector search using LSH (random projections) with exact cosine similarity reranking
+- Hybrid search by combining text and vector results
+- Single-file storage - everything in one `.db` file
 
 ## When to use
 
@@ -19,38 +19,23 @@ sqlitesearch is ideal when you want:
 - Real search functionality for pet projects, demos, or prototypes
 - Simple deployment (just a Python file and a `.db` file)
 
-**Suggested Usage Scenarios:**
+Suggested usage scenarios:
 
-- **In-Memory/Experiments**: Use [minsearch](https://github.com/alexeygrigorev/minsearch) (e.g., in notebooks)
-- **Local/Prototypes**: Use sqlitesearch for small, local projects (up to ~10-20k documents)
-- **Production/High Traffic**: Use enterprise solutions like Postgres, Elasticsearch, Qdrant, or Meilisearch
+- In-Memory/Experiments: Use [minsearch](https://github.com/alexeygrigorev/minsearch) (e.g., in notebooks)
+- Local/Prototypes: Use sqlitesearch for small, local projects (up to ~10-20k documents)
+- Production/High Traffic: Use enterprise solutions like Postgres, Elasticsearch, Qdrant, etc.
 
-## Architecture & Benefits
+## Architecture
 
 sqlitesearch stores the entire search index in a single SQLite database file on disk, unlike server-based systems (e.g., PostgreSQL, Elasticsearch). This single file contains your data tables, index structures for fast lookup, and search metadata.
 
-**No Server Process Required**: SQLite requires no separate server process. It runs inside your Python process, reading/writing directly to the file, eliminating network communication, background daemons, and distributed setup.
-
-**Lightweight**: You install the package and start using it. There is no cluster management, JVM tuning, or DevOps overhead.
-
-**Positioning**: sqlitesearch is particularly well-suited for small to medium-sized projects where local search functionality, data persistence between application restarts, and minimal operational complexity are important.
+SQLite requires no separate server process. It runs inside your Python process, reading/writing directly to the file, eliminating network communication, background daemons, and distributed setup. You install the package and start using it. There is no cluster management, JVM tuning, or DevOps overhead.
 
 Conceptually, it sits between two extremes:
-- **minsearch**: Provides in-memory search without persistence
-- **Production search engines**: Such as Elasticsearch or Qdrant, which are built for large-scale distributed systems
+- minsearch: Provides in-memory search without persistence
+- Production search engines: Such as Elasticsearch or Qdrant, which are built for large-scale distributed systems
 
 It fills the gap for projects that need real persistence and vector search without operational complexity.
-
-**Key Benefits:**
-
-| Feature | Description |
-|---------|-------------|
-| **Simple Storage** | Data is stored in a single `.db` file, making backups and copying straightforward |
-| **Zero External Dependencies** | Runs without requiring services like Elasticsearch, Postgres, or others |
-| **Low Barrier to Entry** | Minimal requirements: Python 3.10+ and only NumPy for vector operations |
-| **Data Persistence** | Indexes survive application restarts and can be loaded directly from disk |
-| **Easy Migration** | Offers a minsearch-compatible API (`fit`, `add`, `search`) for moving away from in-memory minsearch |
-| **Thread Safety** | Achieved through the use of thread-local SQLite connections |
 
 ## Installation
 
@@ -62,25 +47,13 @@ uv add sqlitesearch
 
 sqlitesearch is built primarily on the Python standard library and two key components:
 
-- **SQLite**: The fundamental database engine used for all data persistence
-- **NumPy**: Essential for vector mathematics, including cosine similarity calculations
+- SQLite: The fundamental database engine used for all data persistence
+- NumPy: Essential for vector mathematics, including cosine similarity calculations
 
 The library uses the following extensions and modules:
 
-- **SQLite FTS5**: The extension used to power full-text search
-- **LSH (Locality-Sensitive Hashing)**: Implemented for approximate nearest neighbor search via random projections
-- **Python Standard Library**: Utilizes modules like `sqlite3`, `json`, `pickle`, and `threading`
-
-**Dependencies**: sqlitesearch has minimal external dependencies, primarily relying on NumPy for vector math. SQLite is built into Python and does not require an external service.
-
-**Implementation Details:**
-
-- **Operators**: The `operators.py` module manages numeric and date comparison operators (`>=`, `>`, `<`, `<=`, `==`, `!=`) for range filtering
-- **Database Management**: Thread-local database connections are maintained for each index instance
-- **Data Serialization**:
-  - JSON is used for document payloads
-  - ISO strings are used for dates
-  - Pickling is used for vectors and metadata
+- SQLite FTS5: The extension used to power full-text search
+- LSH (Locality-Sensitive Hashing): Implemented for approximate nearest neighbor search via random projections
 
 ## Text Search
 
@@ -88,20 +61,12 @@ Text search uses SQLite's FTS5 (Full-Text Search) extension with BM25 ranking.
 
 ### How It Works
 
-**Storage:**
 - Documents (JSON) are stored in the `docs` table alongside keyword, numeric, and date fields
-- The `docs_fts` virtual table is the FTS5 index for text fields
-
-**Indexing:**
-- Documents are stored as JSON in the `docs` table
 - Text fields are indexed in FTS5 using Unicode61 tokenizer (with optional Porter stemming)
+- The `docs_fts` virtual table is the FTS5 index for text fields
 - Other fields (keyword, numeric, date) are stored as columns for efficient filtering
-
-**Search Process:**
 - Uses FTS5 `MATCH` queries with BM25 ranking for scoring
 - Supports field boosting to weight certain fields higher
-- Standard SQL WHERE clauses apply filters
-- Results are ranked by BM25 score
 
 ### Basic Usage
 
@@ -130,18 +95,13 @@ for result in results:
 
 ### Filtering
 
-sqlitesearch supports three types of filters:
-
-**Keyword Filters** (exact match):
 ```python
+# Filter by keyword fields
 results = index.search(
     "python",
     filter_dict={"category": "tutorial"}
 )
-```
 
-**Numeric Range Filters**:
-```python
 # Filter by price range
 results = index.search(
     "python",
@@ -155,8 +115,8 @@ results = index.search(
 )
 ```
 
-**Date Range Filters**:
 ```python
+# Filter by date range
 from datetime import date
 
 results = index.search(
@@ -223,22 +183,20 @@ similarity reranking.
 
 ### How It Works
 
-**Storage:**
 - The `docs` table stores document JSON, pickled vectors, and fields for filtering
 - The `lsh_buckets` table holds hash buckets for LSH lookup
 - The `metadata` table stores LSH configuration parameters (dimension, random projection vectors)
 
-**LSH Implementation:**
-- **Random Projections**: Generates a set of random vectors (`n_tables × hash_size`) from a Gaussian distribution
-- **Hashing**: Converts each vector into a binary hash key by computing `sign(random_projection @ vector)`
-- **Multiple Hash Tables**: Uses multiple hash tables (default 8) to enhance recall
+LSH Implementation:
+- Random Projections: Generates a set of random vectors (`n_tables × hash_size`) from a Gaussian distribution
+- Hashing: Converts each vector into a binary hash key by computing `sign(random_projection @ vector)`
+- Multiple Hash Tables: Uses multiple hash tables (default 8) to enhance recall
 
-**Search Process (3 Steps):**
-1. **LSH Candidate Finding**: The query vector is hashed across all tables to quickly retrieve documents with matching hash keys
-2. **Filtering**: Standard keyword, numeric, and date filters are applied to the LSH candidates
-3. **Exact Reranking**: Exact cosine similarity is computed for filtered candidates using NumPy. Results are sorted by similarity and top results returned
+Search Process (3 Steps):
+1. LSH Candidate Finding: The query vector is hashed across all tables to quickly retrieve documents with matching hash keys
+2. Filtering: Standard keyword, numeric, and date filters are applied to the LSH candidates
+3. Exact Reranking: Exact cosine similarity is computed for filtered candidates using NumPy. Results are sorted by similarity and top results returned
 
-**Why LSH + Reranking?**
 This approach balances speed and accuracy for small-to-medium datasets. LSH rapidly narrows down candidates (approximate search), while exact cosine similarity provides accurate final ranking.
 
 ### Basic Usage
@@ -273,7 +231,6 @@ Vector search supports the same filtering options as text search (keyword, numer
 
 The Text Search and Vector Search indexes can share the same underlying SQLite database file and the common `docs` table. This enables hybrid search by combining results from both text and vector indexes at query time.
 
-**Example:**
 ```python
 from sqlitesearch import TextSearchIndex, VectorSearchIndex
 
@@ -314,23 +271,3 @@ index = TextSearchIndex(
 ```python
 index.clear()  # Remove all documents
 ```
-
-## API Reference
-
-The API is designed to match minsearch for easy migration:
-
-**TextSearchIndex:**
-- `fit(docs)` - Index documents (only if index is empty)
-- `add(doc)` - Add a single document
-- `search(query, filter_dict=None, boost_dict=None, num_results=10, output_ids=False)` - Search
-
-**VectorSearchIndex:**
-- `fit(vectors, payload)` - Index vectors with documents (only if index is empty)
-- `add(vector, doc)` - Add a single vector with document
-- `search(query_vector, filter_dict=None, num_results=10, output_ids=False)` - Search
-
-Both index types support:
-- **Keyword Filters**: Exact-match filtering on fields (e.g., `category`, `status`)
-- **Numeric Range Filters**: Filtering based on numerical ranges (e.g., `price >= 50 AND price < 200`)
-- **Date Range Filters**: Filtering on date or datetime fields
-- **Custom ID Fields**: Use of user-defined document identifiers
