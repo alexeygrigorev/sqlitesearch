@@ -56,6 +56,7 @@ class VectorSearchIndex:
         n_tables: int = 8,
         hash_size: int = 16,
         db_path: str = "sqlitesearch_vectors.db",
+        seed: Optional[int] = None,
     ):
         """
         Initialize the VectorSearchIndex.
@@ -68,6 +69,7 @@ class VectorSearchIndex:
             n_tables: Number of LSH hash tables (more = better recall, slower).
             hash_size: Number of bits per hash (more = better precision, slower).
             db_path: Path to the SQLite database file.
+            seed: Random seed for reproducible LSH projections.
         """
         self.keyword_fields = list(keyword_fields) if keyword_fields is not None else []
         self.numeric_fields = list(numeric_fields) if numeric_fields is not None else []
@@ -76,11 +78,14 @@ class VectorSearchIndex:
         self.n_tables = n_tables
         self.hash_size = hash_size
         self.db_path = db_path
+        self._seed = seed
         self._local = threading.local()
 
         # LSH parameters (will be initialized during fit)
         self._dimension = None
         self._random_vectors = None  # Shape: (n_tables, hash_size, dimension)
+        # Flattened view for batch hashing: (n_tables * hash_size, dimension)
+        self._random_vectors_flat = None
 
         # Add id_field to keyword_fields if provided and not already there
         if self.id_field and self.id_field not in self.keyword_fields:
@@ -174,30 +179,64 @@ class VectorSearchIndex:
         Uses random projections from a Gaussian distribution.
         For cosine similarity, we can use random projections and hash based on sign.
         """
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(self._seed)
         self._random_vectors = rng.standard_normal(
             size=(self.n_tables, self.hash_size, dimension)
         ).astype(np.float32)
+        self._random_vectors_flat = self._random_vectors.reshape(
+            self.n_tables * self.hash_size, dimension
+        )
 
     def _hash_vector(self, vector: np.ndarray, table_id: int) -> str:
         """
-        Compute LSH hash for a vector.
-
-        Uses random projection + sign hashing.
-        For cosine similarity: hash = sign(random_projection @ vector)
+        Compute LSH hash for a vector for a single table.
 
         Args:
             vector: 1D numpy array of shape (dimension,).
             table_id: Which hash table to use.
 
         Returns:
-            Hash string (binary as hex).
+            Hash string (binary digits).
         """
         projection = self._random_vectors[table_id] @ vector
-        # Convert to binary hash based on sign
         binary_hash = (projection > 0).astype(np.uint8)
-        # Convert to hex string for storage
         return "".join(str(b) for b in binary_hash)
+
+    def _hash_vector_all_tables(self, vector: np.ndarray) -> list[str]:
+        """
+        Compute LSH hashes for a vector across ALL tables in one matmul.
+
+        Returns:
+            List of hash strings, one per table.
+        """
+        # Single matmul: (n_tables * hash_size, dim) @ (dim,) -> (n_tables * hash_size,)
+        projections = self._random_vectors_flat @ vector
+        # Reshape to (n_tables, hash_size) and convert to binary
+        projections = projections.reshape(self.n_tables, self.hash_size)
+        signs = (projections > 0).astype(np.uint8)
+        # Convert each row to hash string
+        return ["".join(str(b) for b in row) for row in signs]
+
+    def _hash_vectors_batch(self, vectors: np.ndarray) -> np.ndarray:
+        """
+        Compute LSH hashes for ALL vectors across ALL tables in one matmul.
+
+        Args:
+            vectors: 2D array of shape (n_vectors, dimension).
+
+        Returns:
+            Boolean array of shape (n_vectors, n_tables, hash_size).
+        """
+        # (n_tables * hash_size, dim) @ (dim, n_vectors) -> (n_tables * hash_size, n_vectors)
+        projections = self._random_vectors_flat @ vectors.T
+        # Reshape to (n_tables, hash_size, n_vectors) then transpose to (n_vectors, n_tables, hash_size)
+        projections = projections.reshape(self.n_tables, self.hash_size, len(vectors))
+        return (projections > 0).transpose(2, 0, 1)  # (n_vectors, n_tables, hash_size)
+
+    @staticmethod
+    def _signs_to_hash_str(signs_row: np.ndarray) -> str:
+        """Convert a 1D array of 0/1 values to a hash string."""
+        return "".join(str(int(b)) for b in signs_row)
 
     def fit(
         self,
@@ -295,9 +334,12 @@ class VectorSearchIndex:
         col_names = ", ".join(all_cols)
         placeholders = ", ".join(["?"] * len(all_cols))
 
-        # Insert documents and LSH buckets
+        # Batch hash ALL vectors across ALL tables in one matmul
+        all_signs = self._hash_vectors_batch(vectors)  # (n_vectors, n_tables, hash_size)
+
+        # Prepare all doc rows for batch insert
+        doc_rows = []
         for i, (vector, doc) in enumerate(zip(vectors, payload)):
-            # Convert date/datetime objects to ISO format for JSON serialization
             doc_for_json = {}
             for key, value in doc.items():
                 if isinstance(value, (date, datetime)):
@@ -305,14 +347,10 @@ class VectorSearchIndex:
                 else:
                     doc_for_json[key] = value
             doc_json = json.dumps(doc_for_json)
-            vector_bytes = pickle.dumps(vector)
+            vector_bytes = vector.tobytes()
 
             keyword_vals = [doc.get(field) for field in self.keyword_fields]
-
-            # Extract numeric values
             numeric_vals = [doc.get(field) for field in self.numeric_fields]
-
-            # Extract date values and convert to ISO format
             date_vals = []
             for field in self.date_fields:
                 value = doc.get(field)
@@ -321,20 +359,30 @@ class VectorSearchIndex:
                 else:
                     date_vals.append(value)
 
-            # Insert into docs table
-            cursor.execute(
-                f"INSERT INTO docs ({col_names}) VALUES ({placeholders})",
+            doc_rows.append(
                 [doc_json, vector_bytes] + keyword_vals + numeric_vals + date_vals
             )
-            doc_id = cursor.lastrowid
 
-            # Insert into LSH buckets for each table
+        # Insert docs one by one to collect actual autoincrement IDs,
+        # then batch-insert LSH buckets
+        insert_sql = f"INSERT INTO docs ({col_names}) VALUES ({placeholders})"
+        doc_ids = []
+        for row in doc_rows:
+            cursor.execute(insert_sql, row)
+            doc_ids.append(cursor.lastrowid)
+
+        # Prepare all LSH bucket rows for batch insert
+        lsh_rows = []
+        for i, doc_id in enumerate(doc_ids):
             for table_id in range(self.n_tables):
-                hash_key = self._hash_vector(vector, table_id)
-                cursor.execute(
-                    "INSERT INTO lsh_buckets (table_id, hash_key, doc_id) VALUES (?, ?, ?)",
-                    (table_id, hash_key, doc_id)
-                )
+                hash_key = self._signs_to_hash_str(all_signs[i, table_id])
+                lsh_rows.append((table_id, hash_key, doc_id))
+
+        # Batch insert LSH buckets
+        cursor.executemany(
+            "INSERT INTO lsh_buckets (table_id, hash_key, doc_id) VALUES (?, ?, ?)",
+            lsh_rows
+        )
 
         conn.commit()
         return self
@@ -355,6 +403,7 @@ class VectorSearchIndex:
 
         self._dimension = None
         self._random_vectors = None
+        self._random_vectors_flat = None
 
         conn.commit()
         return self
@@ -418,18 +467,47 @@ class VectorSearchIndex:
         return results
 
     def _find_candidates(self, cursor: sqlite3.Cursor, query_vector: np.ndarray) -> set[int]:
-        """Find candidate document IDs using LSH."""
-        candidate_ids = set()
+        """Find candidate document IDs using LSH with multi-probe ranking.
 
-        for table_id in range(self.n_tables):
-            hash_key = self._hash_vector(query_vector, table_id)
-            cursor.execute(
-                "SELECT DISTINCT doc_id FROM lsh_buckets WHERE table_id = ? AND hash_key = ?",
-                (table_id, hash_key)
-            )
-            candidate_ids.update(row["doc_id"] for row in cursor.fetchall())
+        Candidates matching in more hash tables are prioritized. When the total
+        candidate set is large, only the highest-ranked candidates (those
+        appearing in the most tables) are kept, capping at 50K.
+        """
+        # Hash query vector across all tables in one matmul
+        hash_keys = self._hash_vector_all_tables(query_vector)
 
-        return candidate_ids
+        # Single query counting how many tables each candidate matches
+        conditions = []
+        params = []
+        for table_id, hash_key in enumerate(hash_keys):
+            conditions.append("(table_id = ? AND hash_key = ?)")
+            params.extend([table_id, hash_key])
+
+        sql = (
+            f"SELECT doc_id, COUNT(*) as hits FROM lsh_buckets "
+            f"WHERE {' OR '.join(conditions)} "
+            f"GROUP BY doc_id ORDER BY hits DESC "
+            f"LIMIT 50000"
+        )
+        cursor.execute(sql, params)
+        return {row["doc_id"] for row in cursor.fetchall()}
+
+    @staticmethod
+    def _chunked_in_query(cursor, sql_template, ids_list, extra_params=None, chunk_size=900):
+        """Execute a query with IN (?) clause, chunking to avoid SQLite variable limit.
+
+        sql_template should contain {placeholders} where the IN list goes.
+        """
+        if extra_params is None:
+            extra_params = []
+        all_rows = []
+        for i in range(0, len(ids_list), chunk_size):
+            chunk = ids_list[i:i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            sql = sql_template.format(placeholders=placeholders)
+            cursor.execute(sql, chunk + extra_params)
+            all_rows.extend(cursor.fetchall())
+        return all_rows
 
     def _apply_filters(
         self,
@@ -447,20 +525,21 @@ class VectorSearchIndex:
         for field, value in filter_dict.items():
             # Keyword field filters
             if field in self.keyword_fields:
-                placeholders = ",".join("?" * len(ids_list))
                 if value is None:
-                    cursor.execute(
-                        f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+                    rows = self._chunked_in_query(
+                        cursor,
+                        f'SELECT id FROM docs WHERE id IN ({{placeholders}}) '
                         f'AND "{field}" IS NULL',
                         ids_list
                     )
                 else:
-                    cursor.execute(
-                        f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+                    rows = self._chunked_in_query(
+                        cursor,
+                        f'SELECT id FROM docs WHERE id IN ({{placeholders}}) '
                         f'AND "{field}" = ?',
-                        ids_list + [value]
+                        ids_list, [value]
                     )
-                valid_ids = set(row["id"] for row in cursor.fetchall())
+                valid_ids = set(row["id"] for row in rows)
                 filtered_ids &= valid_ids
 
             # Numeric field filters
@@ -489,43 +568,43 @@ class VectorSearchIndex:
             return candidate_ids
 
         ids_list = list(candidate_ids)
-        placeholders = ",".join("?" * len(ids_list))
 
         if value is None:
-            cursor.execute(
-                f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+            rows = self._chunked_in_query(
+                cursor,
+                f'SELECT id FROM docs WHERE id IN ({{placeholders}}) '
                 f'AND "{field}" IS NULL',
                 ids_list
             )
         elif is_range_filter(value):
-            # Range filter: [('>=', 100), ('<', 200)]
             where_conditions = []
-            params = ids_list.copy()
+            extra_params = []
             for op, op_value in value:
                 if op in OPERATORS and op_value is not None:
                     where_conditions.append(f'"{field}" {op} ?')
-                    params.append(op_value)
+                    extra_params.append(op_value)
             if where_conditions:
                 where_sql = " AND " + " AND ".join(where_conditions)
-                cursor.execute(
-                    f'SELECT id FROM docs WHERE id IN ({placeholders}){where_sql}',
-                    params
+                rows = self._chunked_in_query(
+                    cursor,
+                    f'SELECT id FROM docs WHERE id IN ({{placeholders}}){where_sql}',
+                    ids_list, extra_params
                 )
             else:
-                # No valid conditions, return all candidates
-                cursor.execute(
-                    f'SELECT id FROM docs WHERE id IN ({placeholders})',
+                rows = self._chunked_in_query(
+                    cursor,
+                    f'SELECT id FROM docs WHERE id IN ({{placeholders}})',
                     ids_list
                 )
         else:
-            # Exact match
-            cursor.execute(
-                f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+            rows = self._chunked_in_query(
+                cursor,
+                f'SELECT id FROM docs WHERE id IN ({{placeholders}}) '
                 f'AND "{field}" = ?',
-                ids_list + [value]
+                ids_list, [value]
             )
 
-        return set(row["id"] for row in cursor.fetchall()) & candidate_ids
+        return set(row["id"] for row in rows) & candidate_ids
 
     def _apply_date_filter(
         self,
@@ -539,48 +618,47 @@ class VectorSearchIndex:
             return candidate_ids
 
         ids_list = list(candidate_ids)
-        placeholders = ",".join("?" * len(ids_list))
 
         if value is None:
-            cursor.execute(
-                f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+            rows = self._chunked_in_query(
+                cursor,
+                f'SELECT id FROM docs WHERE id IN ({{placeholders}}) '
                 f'AND "{field}" IS NULL',
                 ids_list
             )
         elif is_range_filter(value):
-            # Range filter: [('>=', date(...)), ('<', date(...))]
             where_conditions = []
-            params = ids_list.copy()
+            extra_params = []
             for op, op_value in value:
                 if op in OPERATORS and op_value is not None:
-                    # Convert date/datetime to ISO format for comparison
                     if isinstance(op_value, (date, datetime)):
                         op_value = op_value.isoformat()
                     where_conditions.append(f'"{field}" {op} ?')
-                    params.append(op_value)
+                    extra_params.append(op_value)
             if where_conditions:
                 where_sql = " AND " + " AND ".join(where_conditions)
-                cursor.execute(
-                    f'SELECT id FROM docs WHERE id IN ({placeholders}){where_sql}',
-                    params
+                rows = self._chunked_in_query(
+                    cursor,
+                    f'SELECT id FROM docs WHERE id IN ({{placeholders}}){where_sql}',
+                    ids_list, extra_params
                 )
             else:
-                # No valid conditions, return all candidates
-                cursor.execute(
-                    f'SELECT id FROM docs WHERE id IN ({placeholders})',
+                rows = self._chunked_in_query(
+                    cursor,
+                    f'SELECT id FROM docs WHERE id IN ({{placeholders}})',
                     ids_list
                 )
         else:
-            # Exact match - convert date/datetime to ISO format
             if isinstance(value, (date, datetime)):
                 value = value.isoformat()
-            cursor.execute(
-                f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+            rows = self._chunked_in_query(
+                cursor,
+                f'SELECT id FROM docs WHERE id IN ({{placeholders}}) '
                 f'AND "{field}" = ?',
-                ids_list + [value]
+                ids_list, [value]
             )
 
-        return set(row["id"] for row in cursor.fetchall()) & candidate_ids
+        return set(row["id"] for row in rows) & candidate_ids
 
     def _rerank(
         self,
@@ -590,54 +668,68 @@ class VectorSearchIndex:
         num_results: int,
         output_ids: bool,
     ) -> list[dict[str, Any]]:
-        """Rerank candidates using exact cosine similarity."""
+        """Rerank candidates using exact cosine similarity (vectorized)."""
         if not candidate_ids:
             return []
 
         # Fetch all candidate vectors and documents
         ids_list = list(candidate_ids)
-        placeholders = ",".join("?" * len(ids_list))
-        cursor.execute(
-            f'SELECT id, doc_json, vector_hash FROM docs '
-            f'WHERE id IN ({placeholders})',
+        rows = self._chunked_in_query(
+            cursor,
+            'SELECT id, doc_json, vector_hash FROM docs '
+            'WHERE id IN ({placeholders})',
             ids_list
         )
+        if not rows:
+            return []
 
-        candidates = []
-        for row in cursor.fetchall():
-            vector = pickle.loads(row["vector_hash"])
+        # Deserialize vectors and docs
+        doc_ids = []
+        docs = []
+        vectors_list = []
+        for row in rows:
+            doc_ids.append(row["id"])
             doc = json.loads(row["doc_json"])
-            # Convert ISO date strings back to date/datetime objects
             doc = self._convert_dates(doc)
-            candidates.append((row["id"], vector, doc))
+            docs.append(doc)
+            vectors_list.append(
+                np.frombuffer(row["vector_hash"], dtype=np.float32)
+            )
 
-        # Compute cosine similarities
+        # Vectorized cosine similarity
+        candidate_matrix = np.stack(vectors_list)  # (n_candidates, dim)
+        # Normalize query
         query_norm = np.linalg.norm(query_vector)
         if query_norm == 0:
             query_normalized = query_vector
         else:
             query_normalized = query_vector / query_norm
 
-        scored_candidates = []
-        for doc_id, vector, doc in candidates:
-            vec_norm = np.linalg.norm(vector)
-            if vec_norm == 0:
-                similarity = 0.0
-            else:
-                vec_normalized = vector / vec_norm
-                similarity = float(np.dot(query_normalized, vec_normalized))
+        # Normalize all candidate vectors at once
+        norms = np.linalg.norm(candidate_matrix, axis=1, keepdims=True)
+        # Avoid division by zero
+        norms = np.where(norms == 0, 1.0, norms)
+        normalized_matrix = candidate_matrix / norms
 
-            scored_candidates.append((doc_id, doc, similarity))
+        # Single matrix-vector multiply for all similarities
+        similarities = normalized_matrix @ query_normalized  # (n_candidates,)
 
-        # Sort by similarity (descending)
-        scored_candidates.sort(key=lambda x: x[2], reverse=True)
+        # Get top results using argpartition for efficiency
+        if num_results < len(similarities):
+            # Partial sort: get indices of top num_results
+            top_indices = np.argpartition(similarities, -num_results)[-num_results:]
+            # Sort those indices by similarity
+            top_indices = top_indices[np.argsort(similarities[top_indices])[::-1]]
+        else:
+            top_indices = np.argsort(similarities)[::-1]
 
-        # Take top results
         results = []
-        for doc_id, doc, score in scored_candidates[:num_results]:
-            if score > 0:  # Only return results with positive similarity
+        for idx in top_indices:
+            score = float(similarities[idx])
+            if score > 0:
+                doc = docs[idx]
                 if output_ids:
-                    # Use id_field value if available, otherwise use database id
+                    doc_id = doc_ids[idx]
                     result_id = doc.get(self.id_field, doc_id) if self.id_field else doc_id
                     doc = {**doc, "_id": result_id}
                 results.append(doc)
@@ -658,6 +750,9 @@ class VectorSearchIndex:
         row = cursor.fetchone()
         if row:
             self._random_vectors = pickle.loads(row["value"])
+            self._random_vectors_flat = self._random_vectors.reshape(
+                self.n_tables * self.hash_size, self._dimension
+            )
 
     def _convert_dates(self, doc: dict[str, Any]) -> dict[str, Any]:
         """
