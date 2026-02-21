@@ -150,6 +150,53 @@ index = TextSearchIndex(
 
 By default, stemming is disabled to match minsearch behavior.
 
+### Custom Tokenizer
+
+sqlitesearch uses a `Tokenizer` class for query processing that follows the same
+interface as `minsearch.Tokenizer`. By default, English stop words are removed
+from queries for better performance.
+
+```python
+from sqlitesearch import TextSearchIndex, Tokenizer
+
+# Default: English stop words removed (recommended)
+index = TextSearchIndex(
+    text_fields=["title", "description"],
+    db_path="search.db"
+)
+
+# No stop words
+index = TextSearchIndex(
+    text_fields=["title", "description"],
+    tokenizer=Tokenizer(),
+    db_path="search.db"
+)
+
+# Custom stop words
+index = TextSearchIndex(
+    text_fields=["title", "description"],
+    tokenizer=Tokenizer(stop_words={"custom", "words"}),
+    db_path="search.db"
+)
+```
+
+You can also pass a stemmer callable to the tokenizer. For example, using
+stemmers from [minsearch](https://github.com/alexeygrigorev/minsearch)
+(`pip install minsearch`):
+
+```python
+from minsearch.stemmers import porter_stemmer
+from sqlitesearch import TextSearchIndex, Tokenizer
+
+index = TextSearchIndex(
+    text_fields=["title", "description"],
+    tokenizer=Tokenizer(stop_words='english', stemmer=porter_stemmer),
+    db_path="search.db"
+)
+```
+
+Any `callable(str) -> str` works as a stemmer.
+
 ### Adding Documents
 
 ```python

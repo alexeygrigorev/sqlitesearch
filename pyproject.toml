@@ -34,7 +34,7 @@ dev = [
     "pytest-cov>=4.0.0",
     "ruff>=0.5.0",
     "requests",
-    "minsearch",
+    "minsearch>=0.0.10",
 ]
 
 [tool.hatch.build.targets.wheel]

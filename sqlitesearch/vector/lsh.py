@@ -93,6 +93,9 @@ class VectorSearchIndex:
         if not hasattr(self._local, "conn"):
             self._local.conn = sqlite3.connect(self.db_path)
             self._local.conn.row_factory = sqlite3.Row
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn.execute("PRAGMA cache_size=-64000")
         return self._local.conn
 
     def _init_db(self) -> None:

@@ -6,13 +6,13 @@ extension, enabling efficient BM25 ranking and boolean queries.
 """
 
 import json
-import re
 import sqlite3
 import threading
 from datetime import date, datetime
 from typing import Any, Optional
 
 from sqlitesearch.operators import OPERATORS, is_range_filter
+from sqlitesearch.tokenizer import Tokenizer
 
 
 class TextSearchIndex:
@@ -50,6 +50,7 @@ class TextSearchIndex:
         id_field: Optional[str] = None,
         db_path: str = "sqlitesearch.db",
         stemming: bool = False,
+        tokenizer: Optional[Tokenizer] = None,
     ):
         """
         Initialize the TextSearchIndex.
@@ -62,6 +63,9 @@ class TextSearchIndex:
             id_field: Field name to use as document ID. If None, auto-generates IDs.
             db_path: Path to the SQLite database file.
             stemming: If True, use Porter stemmer for better matching (e.g., "running" matches "run").
+            tokenizer: Tokenizer instance for query processing. If None, uses a default
+                tokenizer with English stop words. Pass Tokenizer() for no stop words,
+                or Tokenizer(stop_words={'custom', 'words'}) for custom stop words.
         """
         self.text_fields = text_fields
         self.keyword_fields = list(keyword_fields) if keyword_fields is not None else []
@@ -70,6 +74,7 @@ class TextSearchIndex:
         self.id_field = id_field
         self.db_path = db_path
         self.stemming = stemming
+        self.tokenizer = tokenizer if tokenizer is not None else Tokenizer(stop_words='english')
         self._local = threading.local()
 
         # Add id_field to keyword_fields if provided and not already there
@@ -83,6 +88,9 @@ class TextSearchIndex:
         if not hasattr(self._local, "conn"):
             self._local.conn = sqlite3.connect(self.db_path)
             self._local.conn.row_factory = sqlite3.Row
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn.execute("PRAGMA cache_size=-64000")
         return self._local.conn
 
     def _init_db(self) -> None:
@@ -192,6 +200,9 @@ class TextSearchIndex:
 
     def _add_docs(self, docs: list[dict[str, Any]]) -> "TextSearchIndex":
         """Internal method to add documents to the index."""
+        if not docs:
+            return self
+
         conn = self._get_conn()
         cursor = conn.cursor()
 
@@ -205,6 +216,15 @@ class TextSearchIndex:
         col_names = ", ".join(all_cols)
         placeholders = ", ".join(["?"] * len(all_cols))
 
+        fts_col_names = ", ".join(
+            ["docid"] + [f'"{field}"' for field in self.text_fields]
+        )
+        fts_placeholders = ", ".join(["?"] * (1 + len(self.text_fields)))
+
+        # Prepare all rows
+        doc_rows = []
+        fts_text_per_doc = []
+
         for doc in docs:
             # Convert date/datetime objects to ISO format for JSON serialization
             doc_for_json = {}
@@ -216,11 +236,8 @@ class TextSearchIndex:
             doc_json = json.dumps(doc_for_json)
 
             keyword_vals = [doc.get(field) for field in self.keyword_fields]
-
-            # Extract numeric values
             numeric_vals = [doc.get(field) for field in self.numeric_fields]
 
-            # Extract date values and convert to ISO format
             date_vals = []
             for field in self.date_fields:
                 value = doc.get(field)
@@ -229,21 +246,29 @@ class TextSearchIndex:
                 else:
                     date_vals.append(value)
 
-            # Insert into main table
-            cursor.execute(
-                f"INSERT INTO docs ({col_names}) VALUES ({placeholders})",
-                [doc_json] + keyword_vals + numeric_vals + date_vals
+            doc_rows.append([doc_json] + keyword_vals + numeric_vals + date_vals)
+            fts_text_per_doc.append(
+                [str(doc.get(field, "")) for field in self.text_fields]
             )
-            doc_id = cursor.lastrowid
 
-            # Insert into FTS5 table
-            fts_cols = [doc_id] + [str(doc.get(field, "")) for field in self.text_fields]
-            fts_placeholders = ", ".join(["?"] * len(fts_cols))
-            fts_col_names = ", ".join(["docid"] + [f'"{field}"' for field in self.text_fields])
-            cursor.execute(
-                f"INSERT INTO docs_fts ({fts_col_names}) VALUES ({fts_placeholders})",
-                fts_cols
-            )
+        # Batch insert into docs table
+        doc_insert_sql = f"INSERT INTO docs ({col_names}) VALUES ({placeholders})"
+        cursor.executemany(doc_insert_sql, doc_rows)
+
+        # Get the range of inserted IDs (AUTOINCREMENT guarantees sequential)
+        cursor.execute("SELECT MAX(id) FROM docs")
+        last_id = cursor.fetchone()[0]
+        first_id = last_id - len(docs) + 1
+
+        # Batch insert into FTS5 table
+        fts_rows = []
+        for i, fts_text in enumerate(fts_text_per_doc):
+            fts_rows.append([first_id + i] + fts_text)
+
+        fts_insert_sql = (
+            f"INSERT INTO docs_fts ({fts_col_names}) VALUES ({fts_placeholders})"
+        )
+        cursor.executemany(fts_insert_sql, fts_rows)
 
         conn.commit()
         return self
@@ -305,6 +330,9 @@ class TextSearchIndex:
         # Build FTS5 query with boosts
         fts_query = self._build_fts_query(query, boost_dict)
 
+        if not fts_query or not fts_query.strip():
+            return []
+
         # Build WHERE clause for filters (keyword, numeric, date)
         where_clauses = []
         where_params = []
@@ -332,20 +360,38 @@ class TextSearchIndex:
 
         where_sql = " AND " + " AND ".join(where_clauses) if where_clauses else ""
 
-        # Execute search query - simpler without content table
-        search_query = f"""
-            SELECT
-                f.docid,
-                d.doc_json,
-                bm25(docs_fts) AS score
-            FROM docs_fts f
-            JOIN docs d ON f.docid = d.id
-            WHERE docs_fts MATCH ?{where_sql}
-            ORDER BY score
-            LIMIT ?
-        """
+        if where_clauses:
+            # With filters: need to join before limiting
+            search_query = f"""
+                SELECT
+                    f.docid,
+                    d.doc_json,
+                    bm25(docs_fts) AS score
+                FROM docs_fts f
+                JOIN docs d ON f.docid = d.id
+                WHERE docs_fts MATCH ?{where_sql}
+                ORDER BY score
+                LIMIT ?
+            """
+            cursor.execute(search_query, [fts_query] + where_params + [num_results])
+        else:
+            # No filters: rank in FTS5 first, then join only top results
+            search_query = f"""
+                SELECT
+                    top.docid,
+                    d.doc_json
+                FROM (
+                    SELECT docid, bm25(docs_fts) AS score
+                    FROM docs_fts
+                    WHERE docs_fts MATCH ?
+                    ORDER BY score
+                    LIMIT ?
+                ) top
+                JOIN docs d ON top.docid = d.id
+                ORDER BY top.score
+            """
+            cursor.execute(search_query, [fts_query, num_results])
 
-        cursor.execute(search_query, [fts_query] + where_params + [num_results])
         rows = cursor.fetchall()
 
         results = []
@@ -506,12 +552,18 @@ class TextSearchIndex:
 
     def _extract_query_terms(self, query: str) -> list[str]:
         """
-        Extract search terms from a query string.
+        Extract search terms from a query string using the configured tokenizer.
 
-        Simple tokenizer that splits on whitespace and special characters.
+        Uses self.tokenizer to split text, remove stop words, and optionally stem.
+        Falls back to raw terms if all tokens are filtered out.
         """
-        terms = re.findall(r'\w+', query.lower())
-        return terms if terms else [query]
+        tokens = [t for t in self.tokenizer.tokenize(query) if t]
+        if tokens:
+            return tokens
+        # Fallback: if all terms were stop words or empty, use raw terms
+        import re
+        raw = re.findall(r'\w+', query.lower())
+        return raw if raw else [query]
 
     def _escape_fts_query(self, query: str) -> str:
         """
