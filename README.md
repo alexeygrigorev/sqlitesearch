@@ -13,17 +13,30 @@ sqlitesearch provides:
 
 ## When to use
 
+sqlitesearch works well for datasets **up to ~100K documents/vectors**. Beyond that, consider dedicated search engines.
+
+| Use case | Recommendation |
+|----------|---------------|
+| In-memory / experiments | [minsearch](https://github.com/alexeygrigorev/minsearch) (e.g., in notebooks) |
+| Local projects, up to 100K docs | **sqlitesearch** |
+| Production / high traffic / 1M+ | Elasticsearch, Qdrant, Milvus, etc. |
+
+**Why 100K?** We benchmarked sqlitesearch on [Simple English Wikipedia (291K articles)](benchmark/WRITEUP.md) for text search and the [Cohere-1M dataset (768d vectors)](benchmark/WRITEUP.md) for vector search. Results:
+
+| Type | 1K | 10K | 100K |
+|------|---:|----:|-----:|
+| Text search QPS | 970 | 604 | 179 |
+| Text search latency | 1ms | 2ms | 6ms |
+| Vector search QPS | 2,152 | 162 | 18 |
+| Vector search latency | 0.5ms | 6ms | 56ms |
+
+At 100K, both text and vector search deliver sub-100ms latency. Beyond that, performance degrades: text search drops to 11 QPS at 291K docs, and vector search to 3 QPS at 1M vectors. See [benchmark/WRITEUP.md](benchmark/WRITEUP.md) for full results, methodology, and VDBBench leaderboard comparison.
+
 sqlitesearch is ideal when you want:
 - Zero infrastructure (no external services)
 - Data persistence across restarts
 - Real search functionality for pet projects, demos, or prototypes
 - Simple deployment (just a Python file and a `.db` file)
-
-Suggested usage scenarios:
-
-- In-Memory/Experiments: Use [minsearch](https://github.com/alexeygrigorev/minsearch) (e.g., in notebooks)
-- Local/Prototypes: Use sqlitesearch for small, local projects (up to ~10-20k documents)
-- Production/High Traffic: Use enterprise solutions like Postgres, Elasticsearch, Qdrant, etc.
 
 ## Architecture
 
@@ -230,7 +243,7 @@ similarity reranking.
 
 ### How It Works
 
-- The `docs` table stores document JSON, pickled vectors, and fields for filtering
+- The `docs` table stores document JSON, vectors (as raw bytes), and fields for filtering
 - The `lsh_buckets` table holds hash buckets for LSH lookup
 - The `metadata` table stores LSH configuration parameters (dimension, random projection vectors)
 
