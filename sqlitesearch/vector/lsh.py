@@ -55,6 +55,7 @@ class VectorSearchIndex:
         id_field: Optional[str] = None,
         n_tables: int = 8,
         hash_size: int = 16,
+        n_probe: int = 0,
         db_path: str = "sqlitesearch_vectors.db",
         seed: Optional[int] = None,
     ):
@@ -68,6 +69,9 @@ class VectorSearchIndex:
             id_field: Field name to use as document ID. If None, auto-generates IDs.
             n_tables: Number of LSH hash tables (more = better recall, slower).
             hash_size: Number of bits per hash (more = better precision, slower).
+            n_probe: Number of bit flips for multi-probe LSH (0=exact only, 1=1-bit
+                neighbors, 2=2-bit neighbors). Higher values improve recall at the
+                cost of more candidates to rerank.
             db_path: Path to the SQLite database file.
             seed: Random seed for reproducible LSH projections.
         """
@@ -77,6 +81,7 @@ class VectorSearchIndex:
         self.id_field = id_field
         self.n_tables = n_tables
         self.hash_size = hash_size
+        self.n_probe = n_probe
         self.db_path = db_path
         self._seed = seed
         self._local = threading.local()
@@ -86,6 +91,12 @@ class VectorSearchIndex:
         self._random_vectors = None  # Shape: (n_tables, hash_size, dimension)
         # Flattened view for batch hashing: (n_tables * hash_size, dimension)
         self._random_vectors_flat = None
+
+        # In-memory vector cache for fast reranking (populated on fit/add/first search)
+        self._cached_vectors = None  # numpy array (n_docs, dim)
+        self._cached_doc_ids = None  # list of doc IDs, same order as _cached_vectors
+        self._cached_docs = None  # list of parsed doc dicts
+        self._id_to_cache_idx = None  # dict: doc_id -> index in cache arrays
 
         # Add id_field to keyword_fields if provided and not already there
         if self.id_field and self.id_field not in self.keyword_fields:
@@ -385,6 +396,27 @@ class VectorSearchIndex:
         )
 
         conn.commit()
+
+        # Update in-memory vector cache
+        new_docs = []
+        for doc_row in doc_rows:
+            doc = json.loads(doc_row[0])  # doc_json is first element
+            doc = self._convert_dates(doc)
+            new_docs.append(doc)
+
+        if self._cached_vectors is None:
+            self._cached_vectors = vectors.copy()
+            self._cached_doc_ids = list(doc_ids)
+            self._cached_docs = new_docs
+            self._id_to_cache_idx = {did: i for i, did in enumerate(doc_ids)}
+        else:
+            offset = len(self._cached_doc_ids)
+            self._cached_vectors = np.vstack([self._cached_vectors, vectors])
+            self._cached_doc_ids.extend(doc_ids)
+            self._cached_docs.extend(new_docs)
+            for i, did in enumerate(doc_ids):
+                self._id_to_cache_idx[did] = offset + i
+
         return self
 
     def clear(self) -> "VectorSearchIndex":
@@ -404,6 +436,10 @@ class VectorSearchIndex:
         self._dimension = None
         self._random_vectors = None
         self._random_vectors_flat = None
+        self._cached_vectors = None
+        self._cached_doc_ids = None
+        self._cached_docs = None
+        self._id_to_cache_idx = None
 
         conn.commit()
         return self
@@ -440,6 +476,10 @@ class VectorSearchIndex:
         if self._dimension is None:
             return []
 
+        # Load vector cache if not yet populated (e.g., reopened existing DB)
+        if self._cached_vectors is None:
+            self._load_vector_cache()
+
         if query_vector.shape[0] != self._dimension:
             raise ValueError(
                 f"Query vector dimension {query_vector.shape[0]} "
@@ -466,31 +506,70 @@ class VectorSearchIndex:
 
         return results
 
-    def _find_candidates(self, cursor: sqlite3.Cursor, query_vector: np.ndarray) -> set[int]:
-        """Find candidate document IDs using LSH with multi-probe ranking.
+    @staticmethod
+    def _generate_probe_keys(exact_hash: str, n_probe: int) -> list[str]:
+        """Generate hash keys to probe: exact match + bit-flipped neighbors.
 
-        Candidates matching in more hash tables are prioritized. When the total
-        candidate set is large, only the highest-ranked candidates (those
-        appearing in the most tables) are kept, capping at 50K.
+        Args:
+            exact_hash: The exact hash string (e.g., "0110101011001010").
+            n_probe: Max number of bits to flip (0=exact only, 1=1-bit, 2=2-bit).
+
+        Returns:
+            List of hash key strings to probe.
+        """
+        keys = [exact_hash]
+        if n_probe <= 0:
+            return keys
+        n = len(exact_hash)
+        chars = list(exact_hash)
+        flip = {'0': '1', '1': '0'}
+        # 1-bit flips
+        for i in range(n):
+            flipped = chars.copy()
+            flipped[i] = flip[flipped[i]]
+            keys.append("".join(flipped))
+        if n_probe >= 2:
+            # 2-bit flips
+            for i in range(n):
+                for j in range(i + 1, n):
+                    flipped = chars.copy()
+                    flipped[i] = flip[flipped[i]]
+                    flipped[j] = flip[flipped[j]]
+                    keys.append("".join(flipped))
+        return keys
+
+    def _find_candidates(self, cursor: sqlite3.Cursor, query_vector: np.ndarray) -> set[int]:
+        """Find candidate document IDs using multi-probe LSH with ranking.
+
+        For each hash table, probes the exact bucket plus neighboring buckets
+        (differing by up to n_probe bits). Candidates matching in more hash
+        tables are prioritized, capping at 50K.
+
+        Uses per-table queries merged in Python (faster than one big OR query
+        with GROUP BY when there are many probe keys).
         """
         # Hash query vector across all tables in one matmul
         hash_keys = self._hash_vector_all_tables(query_vector)
 
-        # Single query counting how many tables each candidate matches
-        conditions = []
-        params = []
-        for table_id, hash_key in enumerate(hash_keys):
-            conditions.append("(table_id = ? AND hash_key = ?)")
-            params.extend([table_id, hash_key])
+        # Per-table queries: each is a fast index lookup
+        hit_counts: dict[int, int] = {}
+        for table_id, exact_key in enumerate(hash_keys):
+            probe_keys = self._generate_probe_keys(exact_key, self.n_probe)
+            placeholders = ",".join("?" * len(probe_keys))
+            cursor.execute(
+                f"SELECT doc_id FROM lsh_buckets "
+                f"WHERE table_id = ? AND hash_key IN ({placeholders})",
+                [table_id] + probe_keys
+            )
+            for row in cursor.fetchall():
+                hit_counts[row["doc_id"]] = hit_counts.get(row["doc_id"], 0) + 1
 
-        sql = (
-            f"SELECT doc_id, COUNT(*) as hits FROM lsh_buckets "
-            f"WHERE {' OR '.join(conditions)} "
-            f"GROUP BY doc_id ORDER BY hits DESC "
-            f"LIMIT 50000"
-        )
-        cursor.execute(sql, params)
-        return {row["doc_id"] for row in cursor.fetchall()}
+        if len(hit_counts) <= 50000:
+            return set(hit_counts.keys())
+
+        # Too many candidates: keep top 50K by hit count
+        sorted_candidates = sorted(hit_counts.items(), key=lambda x: x[1], reverse=True)
+        return {doc_id for doc_id, _ in sorted_candidates[:50000]}
 
     @staticmethod
     def _chunked_in_query(cursor, sql_template, ids_list, extra_params=None, chunk_size=900):
@@ -668,57 +747,52 @@ class VectorSearchIndex:
         num_results: int,
         output_ids: bool,
     ) -> list[dict[str, Any]]:
-        """Rerank candidates using exact cosine similarity (vectorized)."""
+        """Rerank candidates using exact cosine similarity from in-memory cache."""
         if not candidate_ids:
             return []
 
-        # Fetch all candidate vectors and documents
-        ids_list = list(candidate_ids)
-        rows = self._chunked_in_query(
-            cursor,
-            'SELECT id, doc_json, vector_hash FROM docs '
-            'WHERE id IN ({placeholders})',
-            ids_list
-        )
-        if not rows:
-            return []
+        # Use in-memory cache for fast vector lookup
+        if self._cached_vectors is not None and self._id_to_cache_idx is not None:
+            cache_indices = [
+                self._id_to_cache_idx[did] for did in candidate_ids
+                if did in self._id_to_cache_idx
+            ]
+            if not cache_indices:
+                return []
 
-        # Deserialize vectors and docs
-        doc_ids = []
-        docs = []
-        vectors_list = []
-        for row in rows:
-            doc_ids.append(row["id"])
-            doc = json.loads(row["doc_json"])
-            doc = self._convert_dates(doc)
-            docs.append(doc)
-            vectors_list.append(
-                np.frombuffer(row["vector_hash"], dtype=np.float32)
+            cache_indices = np.array(cache_indices)
+            candidate_matrix = self._cached_vectors[cache_indices]
+        else:
+            # Fallback to SQL (should not happen normally)
+            ids_list = list(candidate_ids)
+            rows = self._chunked_in_query(
+                cursor,
+                'SELECT id, doc_json, vector_hash FROM docs '
+                'WHERE id IN ({placeholders})',
+                ids_list
             )
+            if not rows:
+                return []
+            cache_indices = None
+            doc_ids_fb = [row["id"] for row in rows]
+            docs_fb = [self._convert_dates(json.loads(row["doc_json"])) for row in rows]
+            candidate_matrix = np.stack([
+                np.frombuffer(row["vector_hash"], dtype=np.float32) for row in rows
+            ])
 
         # Vectorized cosine similarity
-        candidate_matrix = np.stack(vectors_list)  # (n_candidates, dim)
-        # Normalize query
         query_norm = np.linalg.norm(query_vector)
-        if query_norm == 0:
-            query_normalized = query_vector
-        else:
-            query_normalized = query_vector / query_norm
+        query_normalized = query_vector if query_norm == 0 else query_vector / query_norm
 
-        # Normalize all candidate vectors at once
         norms = np.linalg.norm(candidate_matrix, axis=1, keepdims=True)
-        # Avoid division by zero
         norms = np.where(norms == 0, 1.0, norms)
         normalized_matrix = candidate_matrix / norms
 
-        # Single matrix-vector multiply for all similarities
-        similarities = normalized_matrix @ query_normalized  # (n_candidates,)
+        similarities = normalized_matrix @ query_normalized
 
         # Get top results using argpartition for efficiency
         if num_results < len(similarities):
-            # Partial sort: get indices of top num_results
             top_indices = np.argpartition(similarities, -num_results)[-num_results:]
-            # Sort those indices by similarity
             top_indices = top_indices[np.argsort(similarities[top_indices])[::-1]]
         else:
             top_indices = np.argsort(similarities)[::-1]
@@ -727,14 +801,44 @@ class VectorSearchIndex:
         for idx in top_indices:
             score = float(similarities[idx])
             if score > 0:
-                doc = docs[idx]
+                if cache_indices is not None:
+                    ci = cache_indices[idx]
+                    doc = self._cached_docs[ci].copy()
+                    doc_id = self._cached_doc_ids[ci]
+                else:
+                    doc = docs_fb[idx]
+                    doc_id = doc_ids_fb[idx]
+
                 if output_ids:
-                    doc_id = doc_ids[idx]
                     result_id = doc.get(self.id_field, doc_id) if self.id_field else doc_id
                     doc = {**doc, "_id": result_id}
                 results.append(doc)
 
         return results
+
+    def _load_vector_cache(self) -> None:
+        """Load all vectors and docs from SQLite into in-memory cache."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, doc_json, vector_hash FROM docs ORDER BY id")
+        rows = cursor.fetchall()
+        if not rows:
+            return
+
+        doc_ids = []
+        docs = []
+        vectors_list = []
+        for row in rows:
+            doc_ids.append(row["id"])
+            doc = json.loads(row["doc_json"])
+            doc = self._convert_dates(doc)
+            docs.append(doc)
+            vectors_list.append(np.frombuffer(row["vector_hash"], dtype=np.float32))
+
+        self._cached_vectors = np.stack(vectors_list)
+        self._cached_doc_ids = doc_ids
+        self._cached_docs = docs
+        self._id_to_cache_idx = {did: i for i, did in enumerate(doc_ids)}
 
     def _load_metadata(self) -> None:
         """Load LSH parameters from database."""

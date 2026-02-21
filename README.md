@@ -116,6 +116,8 @@ results = index.search("python", output_ids=True)
 
 Vector search uses Locality-Sensitive Hashing (LSH) with random projections for fast approximate nearest neighbor search, followed by exact cosine similarity reranking.
 
+Each vector is hashed into one bucket per table using random hyperplane projections. At query time, LSH looks up buckets matching the query's hash to find candidates, then reranks them by exact cosine similarity. With `n_probe > 0` (multi-probe), it also checks neighboring buckets that differ by 1 or 2 bits — this dramatically improves recall because similar vectors that landed in an adjacent bucket (due to one projection going the other way) are still found.
+
 ```python
 import numpy as np
 from sqlitesearch import VectorSearchIndex
@@ -125,6 +127,7 @@ index = VectorSearchIndex(
     keyword_fields=["category"],
     n_tables=8,      # Number of hash tables (more = better recall)
     hash_size=16,    # Bits per hash (more = better precision)
+    n_probe=2,       # Multi-probe bit flips (0-2, higher = better recall)
     db_path="vectors.db"
 )
 
@@ -182,10 +185,11 @@ We benchmarked sqlitesearch on [Simple English Wikipedia (291K articles)](benchm
 |------|---:|----:|-----:|
 | Text search QPS | 970 | 604 | 179 |
 | Text search latency | 1ms | 2ms | 6ms |
-| Vector search QPS | 2,152 | 162 | 18 |
-| Vector search latency | 0.5ms | 6ms | 56ms |
+| Vector search QPS | 333 | 39 | 6 |
+| Vector search latency | 3ms | 26ms | 181ms |
+| Vector recall@100 | 0.65 | 0.97 | 0.89 |
 
-At 100K, both text and vector search deliver sub-100ms latency. Beyond that, performance degrades: text search drops to 11 QPS at 291K docs, and vector search to 3 QPS at 1M vectors. See [benchmark/WRITEUP.md](benchmark/WRITEUP.md) for full results, methodology, and VDBBench leaderboard comparison.
+Vector search uses multi-probe LSH (`n_probe=2`) with in-memory vector cache for reranking. At 100K, recall (0.89) is competitive with cloud vector databases like ElasticCloud (0.90). For higher recall, use `n_tables=16` (0.95 recall). See [benchmark/WRITEUP.md](benchmark/WRITEUP.md) for full results, recall tuning, and VDBBench leaderboard comparison.
 
 ## Architecture
 
