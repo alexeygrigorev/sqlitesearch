@@ -8,7 +8,7 @@ sqlitesearch is designed for small, local projects — no servers, no dependenci
 |----------|------:|---------|
 | Text search | up to 125K docs | Excellent — 2.4x faster than minsearch |
 | Text search | 291K docs | Works but slower (11 QPS) |
-| Vector search | up to 100K vectors | Good — 0.89 recall, ~180ms latency |
+| Vector search | up to 100K vectors | Good — up to 0.89 recall with n_probe=2 |
 | Vector search | 1M+ vectors | Too slow — use a dedicated vector DB |
 
 ---
@@ -73,36 +73,58 @@ Multi-probe LSH fixes this by also checking neighboring buckets. Instead of look
 
 The tradeoff is more candidates to rerank. To keep reranking fast, vectors are cached in a numpy array in memory (loaded once from SQLite on first search), so the cosine similarity computation is a single matrix-vector multiply — essentially free compared to the SQL lookup.
 
-### Results (seed=42, 8 tables, 16 hash bits, n_probe=2)
+### Results (seed=42, default: 8 tables, 16 hash bits, n_probe=0)
 
-| N vectors | Insert | vec/s | Recall@100 | Avg lat | P99 lat | QPS | DB size |
-|----------:|-------:|------:|-----------:|--------:|--------:|----:|--------:|
-| 1,000 | 0.13s | 7,944 | 0.6467 | 3.0ms | 4.5ms | 333 | 5 MB |
-| 10,000 | 0.86s | 11,695 | 0.9708 | 25.7ms | 60.9ms | 39 | 47 MB |
-| 100,000 | 8.90s | 11,233 | 0.8897 | 180.7ms | 227.2ms | 6 | 466 MB |
-| 1,000,000 | 122s | 8,221 | 0.5226 | 1,116ms | 1,687ms | 1 | 4,666 MB |
+| N vectors | Insert | vec/s | Recall@10 | Recall@100 | Avg lat | P99 lat | QPS | DB size |
+|----------:|-------:|------:|----------:|-----------:|--------:|--------:|----:|--------:|
+| 1,000 | 0.13s | 7,944 | 0.29 | 0.13 | 0.5ms | 0.9ms | 2,152 | 5 MB |
+| 10,000 | 0.86s | 11,695 | 0.31 | 0.19 | 6.2ms | 19.5ms | 162 | 47 MB |
+| 100,000 | 8.90s | 11,233 | 0.29 | 0.20 | 15.6ms | — | 64 | 466 MB |
+| 1,000,000 | 123s | 8,221 | 0.31 | 0.23 | 128ms | — | 8 | 4,666 MB |
 
-### Recall tuning
+With the default n_probe=0, recall is low but latency is fast. Setting n_probe=2 trades latency for much higher recall (see tuning section below).
 
-Recall depends on three LSH parameters: `n_tables`, `hash_size`, and `n_probe`. Higher values improve recall at the cost of speed. Tested on 100K Cohere vectors (768d) with brute-force ground truth:
+### Recall tuning at 100K
+
+Recall depends on three LSH parameters: `n_tables`, `hash_size`, and `n_probe`. Tested on 100K Cohere vectors (768d) with brute-force ground truth:
 
 | n_tables | hash_size | n_probe | Recall@10 | Recall@100 | Latency | QPS |
 |---------:|----------:|--------:|----------:|-----------:|--------:|----:|
-| 8 | 16 | 0 | 0.29 | 0.20 | 16ms | 64 |
-| 8 (default) | 16 | 2 | 0.95 | 0.89 | 181ms | 6 |
+| 8 (default) | 16 | 0 | 0.29 | 0.20 | 16ms | 64 |
+| 8 | 16 | 1 | 0.83 | 0.70 | 88ms | 11 |
+| 8 | 16 | 2 | 0.95 | 0.89 | 181ms | 6 |
 | 16 | 16 | 1 | 0.95 | 0.87 | 151ms | 7 |
 | 16 | 16 | 2 | 0.99 | 0.95 | 258ms | 4 |
 | 32 | 16 | 1 | 0.99 | 0.96 | 209ms | 5 |
 
-For higher recall, increase `n_tables`:
-
 ```python
-# Default: 0.89 recall at 100K
+# Default: fast, low recall
 index = VectorSearchIndex(db_path="vectors.db")
 
-# Higher recall: 0.95 recall at 100K (slower inserts, larger DB)
+# Better recall (0.89 at 100K)
+index = VectorSearchIndex(n_probe=2, db_path="vectors.db")
+
+# Best recall (0.95 at 100K, slower inserts, larger DB)
 index = VectorSearchIndex(n_tables=16, n_probe=2, db_path="vectors.db")
 ```
+
+### Recall tuning at 1M (n_probe=0 only)
+
+At 1M, we tested whether more tables and fewer hash bits can compensate for no multi-probe. All configs use n_probe=0:
+
+| n_tables | hash_size | Recall@10 | Recall@100 | Latency | QPS | Insert | DB size |
+|---------:|----------:|----------:|-----------:|--------:|----:|-------:|--------:|
+| 8 | 16 | 0.31 | 0.23 | 128ms | 8 | 123s | 4.7 GB |
+| 8 | 10 | 0.38 | 0.28 | 418ms | 2 | 87s | 4.5 GB |
+| 8 | 8 | 0.41 | 0.28 | 618ms | 2 | 82s | 4.5 GB |
+| 16 | 8 | 0.57 | 0.42 | 1,089ms | 1 | 135s | 5.0 GB |
+| 32 | 8 | 0.78 | 0.60 | 2,100ms | 0.5 | 258s | 6.1 GB |
+| 32 | 6 | 0.78 | 0.62 | 3,197ms | 0.3 | 221s | 5.9 GB |
+| 64 | 10 | 0.90 | 0.76 | 2,327ms | 0.4 | 808s | 8.7 GB |
+| 64 | 8 | 0.95 | 0.81 | 3,993ms | 0.3 | 567s | 8.3 GB |
+| 64 | 6 | 0.94 | 0.82 | 6,450ms | 0.2 | 438s | 7.9 GB |
+
+Even with 64 tables and 6 hash bits, recall@100 tops out at 0.82 with 6.5s latency. Without multi-probe, you need so many tables that every query scans a large fraction of the dataset — at which point you've lost the benefit of LSH.
 
 ### VDBBench leaderboard comparison (Cohere-1M)
 
@@ -116,15 +138,16 @@ ElasticCloud-8c60g-fm             1,925     11.3   0.8960
 QdrantCloud-16c64g                1,242      6.4   0.9470
 Pinecone-p2.x8                    1,147     13.7   0.9260
 ----------------------------------------------------------
-sqlitesearch [100K]                   6    227.2   0.8897
-sqlitesearch [1M]                     1  1,687.4   0.5226
+sqlitesearch [100K, n_probe=2]        6    227.2   0.8897
+sqlitesearch [1M, n_probe=0]          8    128.3   0.2275
+sqlitesearch [1M, 64t/8b]            0.3  3993.1   0.8106
 ```
 
 Note: Leaderboard = multi-process on cloud hardware (8-16 cores, 32-128GB RAM). sqlitesearch = serial single-process.
 
 ### Vector search optimizations applied
 
-1. Multi-probe LSH — probe neighboring hash buckets (1-bit and 2-bit flips) to dramatically increase recall. Default `n_probe=2` probes 137 buckets per table instead of 1
+1. Multi-probe LSH — probe neighboring hash buckets (1-bit and 2-bit flips) to increase recall. `n_probe=2` probes 137 buckets per table instead of 1
 2. In-memory vector cache — vectors are cached in a numpy array after insert/load, eliminating SQLite I/O during reranking
 3. Per-table candidate queries — separate SQL query per hash table merged in Python (faster than one large OR query with GROUP BY)
 4. Vectorized batch hashing — single matmul for all vectors x all tables during insert
@@ -134,17 +157,9 @@ Note: Leaderboard = multi-process on cloud hardware (8-16 cores, 32-128GB RAM). 
 8. Chunked IN-queries — avoids SQLite variable limit for large candidate sets
 9. Multi-probe candidate cap — limits reranking to top 50K candidates by table-hit count
 
-### Recall improvement timeline
-
-| Version | Recall@100 (100K) | Avg latency (100K) |
-|---------|------------------:|-------------------:|
-| Before multi-probe (n_probe=0) | 0.20 | 56ms |
-| Multi-probe n_probe=1 | 0.70 | 107ms |
-| Multi-probe n_probe=2 + cache | 0.89 | 181ms |
-
 ### Why 1M doesn't scale
 
-At 1M with 768 dimensions, LSH with random projections reaches its limits. The top-100 nearest neighbors often have moderate cosine similarity (0.6-0.8), where the probability of landing in the same or nearby hash bucket is low. Even with multi-probe (137 buckets per table), the candidate pool at 1M only covers ~1% of the dataset — not enough for high recall. Purpose-built vector databases use HNSW or IVF indexes with in-memory graph traversal, which scales to millions of vectors.
+At 1M with 768 dimensions, LSH with random projections reaches its limits. The top-100 nearest neighbors often have moderate cosine similarity (0.6-0.8), where the probability of landing in the same or nearby hash bucket is low even with multi-probe. Without multi-probe, getting competitive recall requires 64 tables and small hash sizes, which makes every query scan a large fraction of the dataset (6+ seconds per query, 8+ GB database). Purpose-built vector databases use HNSW or IVF indexes with in-memory graph traversal, which scales to millions of vectors.
 
 ---
 
