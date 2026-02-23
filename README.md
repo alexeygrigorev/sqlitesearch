@@ -114,7 +114,15 @@ results = index.search("python", output_ids=True)
 
 ## Vector Search
 
-Vector search uses Locality-Sensitive Hashing (LSH) with random projections for fast approximate nearest neighbor search, followed by exact cosine similarity reranking.
+Vector search supports three modes for approximate nearest neighbor search, all followed by exact cosine similarity reranking:
+
+| Mode | Best for | How it works |
+|------|----------|--------------|
+| **LSH** (default) | Up to 100K vectors | Random hyperplane projections + bucket lookup |
+| **IVF** | 10K-500K vectors | K-means clustering + nearest-cluster probe |
+| **HNSW** | 10K-1M+ vectors | Hierarchical proximity graph traversal |
+
+### LSH (default)
 
 Each vector is hashed into one bucket per table using random hyperplane projections. At query time, LSH looks up buckets matching the query's hash to find candidates, then reranks them by exact cosine similarity. With `n_probe > 0` (multi-probe), it also checks neighboring buckets that differ by 1 or 2 bits — this dramatically improves recall because similar vectors that landed in an adjacent bucket (due to one projection going the other way) are still found.
 
@@ -122,7 +130,6 @@ Each vector is hashed into one bucket per table using random hyperplane projecti
 import numpy as np
 from sqlitesearch import VectorSearchIndex
 
-# Create an index
 index = VectorSearchIndex(
     keyword_fields=["category"],
     n_tables=8,      # Number of hash tables (more = better recall)
@@ -131,14 +138,39 @@ index = VectorSearchIndex(
     db_path="vectors.db"
 )
 
-# Index vectors with documents
-vectors = np.random.rand(100, 384)  # 100 documents, 384 dimensions
+vectors = np.random.rand(100, 384)
 documents = [{"category": "test"} for _ in range(100)]
 index.fit(vectors, documents)
 
-# Search
 query = np.random.rand(384)
 results = index.search(query)
+```
+
+### IVF (Inverted File Index)
+
+Clusters vectors using k-means, then searches only the nearest clusters at query time. Good balance of build speed and recall.
+
+```python
+index = VectorSearchIndex(
+    mode="ivf",
+    n_clusters=None,        # Auto-scales (sqrt(n), capped at 256)
+    n_probe_clusters=8,     # Clusters to search (more = better recall, slower)
+    db_path="vectors.db"
+)
+```
+
+### HNSW (Hierarchical Navigable Small World)
+
+Builds a multi-layer proximity graph. Highest recall and fastest search, but slower to build.
+
+```python
+index = VectorSearchIndex(
+    mode="hnsw",
+    m=16,                   # Max connections per node (more = better recall)
+    ef_construction=200,    # Build-time beam width (more = better graph)
+    ef_search=50,           # Search-time beam width (more = better recall)
+    db_path="vectors.db"
+)
 ```
 
 Filtering works the same as text search - see the [Filtering](#filtering) section.
