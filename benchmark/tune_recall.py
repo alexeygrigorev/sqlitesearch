@@ -21,7 +21,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from sqlitesearch.vector.lsh import VectorSearchIndex
+from sqlitesearch.vector.index import VectorSearchIndex
 
 DATASET_DIR = Path("/tmp/vectordb_bench/dataset/cohere_medium_1m")
 K = 100
@@ -143,21 +143,23 @@ def main():
 
     # Parameter grid: (n_tables, hash_size, n_probe)
     configs = [
-        # Baseline (old default)
+        # Baseline
         (8, 16, 0),
-        # n_probe sweep with 8 tables
-        (8, 16, 1),
-        (8, 16, 2),
-        (8, 10, 1),
-        (8, 8, 1),
-        # More tables + moderate probe
-        (16, 16, 1),
-        (16, 16, 2),
-        (16, 10, 1),
-        (16, 8, 1),
-        (32, 16, 1),
+        # Fewer bits, n_probe=0
+        (8, 10, 0),
+        (8, 8, 0),
+        (8, 6, 0),
+        (8, 4, 0),
+        # More tables, n_probe=0
+        (16, 10, 0),
+        (16, 8, 0),
+        (16, 6, 0),
+        (32, 10, 0),
         (32, 8, 0),
-        (32, 8, 1),
+        (32, 6, 0),
+        (64, 10, 0),
+        (64, 8, 0),
+        (64, 6, 0),
     ]
 
     print(f"\n{'='*90}")
