@@ -33,11 +33,22 @@ def load_data(n_vectors):
     """Load Cohere dataset and compute brute-force ground truth."""
     print(f"Loading {n_vectors:,} vectors from Cohere dataset...")
     t0 = time.time()
-    train_table = pq.read_table(DATASET_DIR / "shuffle_train.parquet")
-    train_embs = np.array(train_table.column("emb").to_pylist(), dtype=np.float32)[:n_vectors]
+    pf = pq.ParquetFile(DATASET_DIR / "shuffle_train.parquet")
+    # Read only needed rows in batches for speed
+    train_rows = []
+    remaining = n_vectors
+    for batch in pf.iter_batches(batch_size=min(100000, n_vectors), columns=["emb"]):
+        take = min(remaining, len(batch))
+        train_rows.extend(batch.column("emb")[:take].to_pylist())
+        remaining -= take
+        if remaining <= 0:
+            break
+    train_embs = np.array(train_rows, dtype=np.float32)
+    del train_rows
 
-    test_table = pq.read_table(DATASET_DIR / "test.parquet")
+    test_table = pq.read_table(DATASET_DIR / "test.parquet", columns=["emb"])
     test_embs = np.array(test_table.column("emb").to_pylist(), dtype=np.float32)[:N_QUERIES]
+    del test_table
     print(f"  Loaded in {time.time()-t0:.1f}s  dim={train_embs.shape[1]}  n={train_embs.shape[0]:,}")
 
     # Brute-force ground truth
@@ -51,13 +62,17 @@ def load_data(n_vectors):
     test_norms = np.where(test_norms == 0, 1.0, test_norms)
     test_normalized = test_embs / test_norms
 
-    sim_matrix = test_normalized @ train_normalized.T
+    # Use batch matmul - precompute transpose once, then full matmul
+    train_normalized_T = np.ascontiguousarray(train_normalized.T)
+    sim_matrix = test_normalized @ train_normalized_T
+    del train_normalized_T
     ground_truth = []
     for i in range(N_QUERIES):
         top_k_idx = np.argpartition(sim_matrix[i], -K)[-K:]
         top_k_idx = top_k_idx[np.argsort(sim_matrix[i, top_k_idx])[::-1]]
         ground_truth.append([int(x) for x in top_k_idx])
-    print(f"{time.time()-t0:.1f}s")
+    del sim_matrix
+    print(f"{time.time()-t0:.1f}s", flush=True)
 
     return train_embs, test_embs, ground_truth
 
@@ -136,10 +151,13 @@ CONFIGS = [
     {"mode": "ivf", "label": "IVF auto/4p", "n_probe_clusters": 4},
     {"mode": "ivf", "label": "IVF auto/8p", "n_probe_clusters": 8},
     {"mode": "ivf", "label": "IVF auto/16p", "n_probe_clusters": 16},
-    # HNSW configs
+    # HNSW configs (high quality, slow build)
     {"mode": "hnsw", "label": "HNSW m16/ef50", "m": 16, "ef_construction": 200, "ef_search": 50},
     {"mode": "hnsw", "label": "HNSW m16/ef100", "m": 16, "ef_construction": 200, "ef_search": 100},
     {"mode": "hnsw", "label": "HNSW m32/ef200", "m": 32, "ef_construction": 200, "ef_search": 200},
+    # HNSW configs (fast build for large datasets)
+    {"mode": "hnsw", "label": "HNSW-fast ef50", "m": 12, "ef_construction": 32, "ef_search": 50},
+    {"mode": "hnsw", "label": "HNSW-fast ef100", "m": 12, "ef_construction": 32, "ef_search": 100},
 ]
 
 
@@ -158,12 +176,23 @@ def main():
         default=["lsh", "ivf", "hnsw"],
         help="Modes to benchmark (default: all)",
     )
+    parser.add_argument(
+        "--configs",
+        nargs="+",
+        default=None,
+        help="Filter by config label substring (e.g. 'm16/ef100' 'auto/16p')",
+    )
     args = parser.parse_args()
 
     for n_vectors in args.n_vectors:
         train_embs, test_embs, ground_truth = load_data(n_vectors)
 
         configs = [c for c in CONFIGS if c["mode"] in args.modes]
+        if args.configs:
+            configs = [
+                c for c in configs
+                if any(f in c["label"] for f in args.configs)
+            ]
 
         print(f"\n{'='*95}")
         print(f"Benchmarking {n_vectors:,} vectors  |  {N_QUERIES} queries  |  top-{K}")

@@ -2,8 +2,11 @@
 HNSW (Hierarchical Navigable Small World) search strategy.
 
 Builds a multi-layer proximity graph for fast approximate nearest neighbor search.
+Graph is stored using vector-array indices internally (not doc_ids) to avoid
+dict lookups in the hot path.
 """
 
+import heapq
 import math
 import pickle
 import sqlite3
@@ -29,19 +32,23 @@ class HNSWStrategy:
         self._seed = seed
 
         self._dimension: Optional[int] = None
-        self._entry_point: Optional[int] = None
+        # Entry point and graph stored as vector-array indices (not doc_ids)
+        self._entry_point: Optional[int] = None  # index into _vectors
         self._max_layer: int = 0
         self._ml = 1.0 / math.log(m) if m > 1 else 1.0
 
-        # In-memory graph: layer -> node_id -> list[neighbor_ids]
+        # Graph: layer -> idx -> list[neighbor_idx]
+        # All values are vector-array indices (0..N-1)
         self._graph: dict[int, dict[int, list[int]]] = {}
-        self._node_layers: dict[int, int] = {}  # node_id -> max layer for that node
+        self._node_layers: dict[int, int] = {}  # idx -> max layer
         self._graph_loaded = False
 
-        # Reference to orchestrator's vector cache (set by orchestrator)
+        # Normalized vectors (contiguous numpy array)
         self._vectors: Optional[np.ndarray] = None
+        # Mapping between doc_ids and vector-array indices
         self._doc_ids: Optional[list[int]] = None
         self._id_to_idx: Optional[dict[int, int]] = None
+        self._n_nodes: int = 0
 
     def init_tables(self, cursor: sqlite3.Cursor) -> None:
         cursor.execute("""
@@ -70,6 +77,7 @@ class HNSWStrategy:
             ("hnsw_m", self.m),
             ("hnsw_ef_construction", self.ef_construction),
             ("hnsw_node_layers", self._node_layers),
+            ("hnsw_n_nodes", self._n_nodes),
         ]:
             cursor.execute(
                 "INSERT OR REPLACE INTO hnsw_meta (key, value) VALUES (?, ?)",
@@ -88,6 +96,7 @@ class HNSWStrategy:
         self.m = meta.get("hnsw_m", self.m)
         self.ef_construction = meta.get("hnsw_ef_construction", self.ef_construction)
         self._node_layers = meta.get("hnsw_node_layers", {})
+        self._n_nodes = meta.get("hnsw_n_nodes", 0)
         self._ml = 1.0 / math.log(self.m) if self.m > 1 else 1.0
         self.m_max0 = self.m * 2
         return True
@@ -99,25 +108,23 @@ class HNSWStrategy:
         """Build HNSW graph from scratch."""
         self._dimension = vectors.shape[1]
 
-        # Set up vector lookup
         self._vectors = self._normalize(vectors)
         self._doc_ids = list(doc_ids)
         self._id_to_idx = {did: i for i, did in enumerate(doc_ids)}
+        self._n_nodes = len(doc_ids)
 
-        # Reset graph
         self._graph = {}
         self._node_layers = {}
         self._entry_point = None
         self._max_layer = 0
 
         rng = np.random.default_rng(self._seed)
+        vecs = self._vectors  # local ref for speed
 
-        # Insert all nodes
-        for i, doc_id in enumerate(doc_ids):
-            self._insert_node(doc_id, rng)
+        for idx in range(self._n_nodes):
+            self._insert_node_idx(idx, rng, vecs)
 
-        # Save graph to DB
-        self._save_graph(cursor)
+        self._save_graph_with_docids(cursor, doc_ids)
         self.save_params(cursor)
 
     def add_to_index(self, cursor: sqlite3.Cursor, vectors: np.ndarray, doc_ids: list[int]) -> None:
@@ -126,12 +133,9 @@ class HNSWStrategy:
             self.build_index(cursor, vectors, doc_ids)
             return
 
-        # Ensure graph is loaded
         if not self._graph_loaded:
             self._load_graph(cursor)
 
-        # Update vector lookup (orchestrator updates cache, we reference it)
-        # We need to extend our local references
         normed_new = self._normalize(vectors)
         if self._vectors is not None:
             self._vectors = np.vstack([self._vectors, normed_new])
@@ -140,18 +144,20 @@ class HNSWStrategy:
             self._doc_ids = []
             self._id_to_idx = {}
 
-        offset = len(self._doc_ids)
+        offset = self._n_nodes
         for i, did in enumerate(doc_ids):
             self._doc_ids.append(did)
             self._id_to_idx[did] = offset + i
 
         rng = np.random.default_rng(self._seed)
+        vecs = self._vectors
 
-        for doc_id in doc_ids:
-            self._insert_node(doc_id, rng)
+        for i in range(len(doc_ids)):
+            idx = offset + i
+            self._n_nodes += 1
+            self._insert_node_idx(idx, rng, vecs)
 
-        # Save new edges
-        self._save_graph(cursor)
+        self._save_graph_with_docids(cursor, self._doc_ids)
         self.save_params(cursor)
 
     def find_candidates(self, cursor: sqlite3.Cursor, query_vector: np.ndarray) -> set[int]:
@@ -159,21 +165,20 @@ class HNSWStrategy:
         if self._entry_point is None:
             return set()
 
-        # Ensure graph is loaded into memory
         if not self._graph_loaded:
             self._load_graph(cursor)
 
         query_normed = query_vector / (np.linalg.norm(query_vector) + 1e-10)
+        vecs = self._vectors
 
-        # Greedy search from top layer to layer 1
         current = self._entry_point
         for layer in range(self._max_layer, 0, -1):
-            current = self._greedy_search(query_normed, current, layer)
+            current = self._greedy_search(query_normed, current, layer, vecs)
 
-        # Beam search at layer 0
-        candidates = self._beam_search(query_normed, current, 0, self.ef_search)
+        results = self._beam_search(query_normed, current, 0, self.ef_search, vecs)
 
-        return {node_id for node_id, _ in candidates}
+        # Convert indices back to doc_ids
+        return {self._doc_ids[idx] for _, idx in results}
 
     def clear_index(self, cursor: sqlite3.Cursor) -> None:
         cursor.execute("DELETE FROM hnsw_edges")
@@ -187,172 +192,150 @@ class HNSWStrategy:
         self._doc_ids = None
         self._id_to_idx = None
         self._graph_loaded = False
+        self._n_nodes = 0
 
-    # --- Internal HNSW methods ---
+    # --- Core HNSW operations (index-based, no dict lookups in hot path) ---
 
-    def _similarity(self, id_a: int, id_b: int) -> float:
-        """Cosine similarity between two nodes using cached normalized vectors."""
-        idx_a = self._id_to_idx[id_a]
-        idx_b = self._id_to_idx[id_b]
-        return float(self._vectors[idx_a] @ self._vectors[idx_b])
-
-    def _query_similarity(self, query_normed: np.ndarray, node_id: int) -> float:
-        """Cosine similarity between query and a node."""
-        idx = self._id_to_idx[node_id]
-        return float(query_normed @ self._vectors[idx])
-
-    def _random_level(self, rng: np.random.Generator) -> int:
-        """Generate random level for a new node."""
-        return int(-math.log(rng.random() + 1e-10) * self._ml)
-
-    def _get_neighbors(self, node_id: int, layer: int) -> list[int]:
-        """Get neighbors of a node at a given layer."""
-        if layer in self._graph and node_id in self._graph[layer]:
-            return self._graph[layer][node_id]
-        return []
-
-    def _set_neighbors(self, node_id: int, layer: int, neighbors: list[int]) -> None:
-        """Set neighbors of a node at a given layer."""
-        if layer not in self._graph:
-            self._graph[layer] = {}
-        self._graph[layer][node_id] = neighbors
-
-    def _insert_node(self, node_id: int, rng: np.random.Generator) -> None:
-        """Insert a single node into the HNSW graph."""
-        level = self._random_level(rng)
-        self._node_layers[node_id] = level
+    def _insert_node_idx(self, idx: int, rng: np.random.Generator, vecs: np.ndarray) -> None:
+        """Insert node by vector-array index."""
+        level = int(-math.log(rng.random() + 1e-10) * self._ml)
+        self._node_layers[idx] = level
 
         if self._entry_point is None:
-            # First node
-            self._entry_point = node_id
+            self._entry_point = idx
             self._max_layer = level
             for l in range(level + 1):
-                self._set_neighbors(node_id, l, [])
+                if l not in self._graph:
+                    self._graph[l] = {}
+                self._graph[l][idx] = []
             return
 
+        q_vec = vecs[idx]
         current = self._entry_point
-        q_normed = self._vectors[self._id_to_idx[node_id]]
 
-        # Greedy descent from top layer to level+1
+        # Greedy descent
         for layer in range(self._max_layer, level, -1):
-            current = self._greedy_search(q_normed, current, layer)
+            current = self._greedy_search(q_vec, current, layer, vecs)
 
-        # Insert at layers level down to 0
+        # Insert at layers level..0
         for layer in range(min(level, self._max_layer), -1, -1):
-            # Find ef_construction nearest neighbors at this layer
-            candidates = self._beam_search(q_normed, current, layer, self.ef_construction)
+            candidates = self._beam_search(q_vec, current, layer, self.ef_construction, vecs)
 
-            # Select M best neighbors
             m_max = self.m_max0 if layer == 0 else self.m
-            neighbors = self._select_neighbors(node_id, candidates, m_max)
+            neighbors = [nid for _, nid in candidates[:m_max]]
 
-            # Set bidirectional connections
-            self._set_neighbors(node_id, layer, neighbors)
+            # Set forward edges
+            if layer not in self._graph:
+                self._graph[layer] = {}
+            self._graph[layer][idx] = neighbors
+
+            # Set reverse edges + prune
+            layer_graph = self._graph[layer]
             for neighbor in neighbors:
-                nbr_neighbors = self._get_neighbors(neighbor, layer)
-                nbr_neighbors.append(node_id)
-                # Prune if over capacity
-                if len(nbr_neighbors) > m_max:
-                    nbr_neighbors = self._select_neighbors(
-                        neighbor,
-                        [(n, self._similarity(neighbor, n)) for n in nbr_neighbors],
-                        m_max,
-                    )
-                self._set_neighbors(neighbor, layer, nbr_neighbors)
+                nbr_list = layer_graph.get(neighbor)
+                if nbr_list is None:
+                    layer_graph[neighbor] = [idx]
+                    continue
+                nbr_list.append(idx)
+                if len(nbr_list) > m_max:
+                    # Batch prune
+                    nbr_arr = np.array(nbr_list, dtype=np.int64)
+                    sims = vecs[nbr_arr] @ vecs[neighbor]
+                    top_idx = np.argpartition(sims, -m_max)[-m_max:]
+                    layer_graph[neighbor] = nbr_arr[top_idx].tolist()
 
             if candidates:
-                current = candidates[0][0]  # best candidate for next layer
+                current = candidates[0][1]
 
-        # Update entry point if new node has higher layer
         if level > self._max_layer:
             self._max_layer = level
-            self._entry_point = node_id
+            self._entry_point = idx
 
-    def _select_neighbors(
-        self, node_id: int, candidates: list, m_max: int
-    ) -> list[int]:
-        """Select best neighbors from candidates. Candidates can be (id, sim) tuples or just ids."""
-        if not candidates:
-            return []
-
-        if isinstance(candidates[0], tuple):
-            scored = candidates
-        else:
-            scored = [
-                (c, self._similarity(node_id, c)) for c in candidates
-            ]
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [c for c, _ in scored[:m_max]]
-
-    def _greedy_search(self, query_normed: np.ndarray, entry: int, layer: int) -> int:
-        """Greedy search at a single layer — returns closest node."""
+    def _greedy_search(self, q_vec: np.ndarray, entry: int, layer: int, vecs: np.ndarray) -> int:
+        """Greedy search — all operations use array indices, no dict lookups."""
         current = entry
-        current_sim = self._query_similarity(query_normed, current)
+        current_sim = float(q_vec @ vecs[current])
+        layer_graph = self._graph.get(layer, {})
 
         while True:
-            changed = False
-            for neighbor in self._get_neighbors(current, layer):
-                sim = self._query_similarity(query_normed, neighbor)
-                if sim > current_sim:
-                    current = neighbor
-                    current_sim = sim
-                    changed = True
-            if not changed:
+            neighbors = layer_graph.get(current)
+            if not neighbors:
+                break
+
+            nbr_arr = np.array(neighbors, dtype=np.int64)
+            sims = vecs[nbr_arr] @ q_vec
+            best_i = int(np.argmax(sims))
+
+            if sims[best_i] > current_sim:
+                current = neighbors[best_i]
+                current_sim = float(sims[best_i])
+            else:
                 break
 
         return current
 
     def _beam_search(
-        self, query_normed: np.ndarray, entry: int, layer: int, ef: int
-    ) -> list[tuple[int, float]]:
-        """Beam search at a single layer — returns list of (node_id, similarity)."""
+        self, q_vec: np.ndarray, entry: int, layer: int, ef: int, vecs: np.ndarray
+    ) -> list[tuple[float, int]]:
+        """Beam search with heaps. Returns [(sim, idx), ...] sorted desc."""
+        entry_sim = float(q_vec @ vecs[entry])
         visited: set[int] = {entry}
-        entry_sim = self._query_similarity(query_normed, entry)
 
-        # candidates: max-heap by similarity (we want to expand best first)
-        # results: min-heap by similarity (we want to evict worst)
-        candidates = [(entry, entry_sim)]
-        results = [(entry, entry_sim)]
+        # Max-heap for candidates (negate sim), min-heap for results
+        candidates = [(-entry_sim, entry)]
+        results = [(entry_sim, entry)]
+        worst_sim = entry_sim
+        layer_graph = self._graph.get(layer, {})
 
         while candidates:
-            # Pop best candidate (highest similarity)
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            current, current_sim = candidates.pop(0)
-
-            # Worst in results
-            results.sort(key=lambda x: x[1])
-            worst_sim = results[0][1]
+            neg_sim, current = heapq.heappop(candidates)
+            current_sim = -neg_sim
 
             if current_sim < worst_sim and len(results) >= ef:
                 break
 
-            for neighbor in self._get_neighbors(current, layer):
-                if neighbor in visited:
-                    continue
-                visited.add(neighbor)
+            neighbors = layer_graph.get(current)
+            if not neighbors:
+                continue
 
-                sim = self._query_similarity(query_normed, neighbor)
+            # Filter visited
+            new_nbrs = [n for n in neighbors if n not in visited]
+            if not new_nbrs:
+                continue
+            visited.update(new_nbrs)
 
-                results.sort(key=lambda x: x[1])
-                if len(results) < ef or sim > results[0][1]:
-                    candidates.append((neighbor, sim))
-                    results.append((neighbor, sim))
-                    if len(results) > ef:
-                        results.sort(key=lambda x: x[1])
-                        results.pop(0)
+            # Batch similarity
+            nbr_arr = np.array(new_nbrs, dtype=np.int64)
+            sims = vecs[nbr_arr] @ q_vec
 
-        results.sort(key=lambda x: x[1], reverse=True)
+            # Vectorized filter: only process sims above worst (or all if results < ef)
+            if len(results) >= ef:
+                mask = sims > worst_sim
+                good_indices = np.where(mask)[0]
+            else:
+                good_indices = np.arange(len(new_nbrs))
+
+            for i in good_indices:
+                sim_f = float(sims[i])
+                nbr = new_nbrs[i]
+                heapq.heappush(candidates, (-sim_f, nbr))
+                heapq.heappush(results, (sim_f, nbr))
+                if len(results) > ef:
+                    heapq.heappop(results)
+                worst_sim = results[0][0]
+
+        results.sort(reverse=True)
         return results
 
-    def _save_graph(self, cursor: sqlite3.Cursor) -> None:
-        """Save in-memory graph to database."""
+    def _save_graph_with_docids(self, cursor: sqlite3.Cursor, doc_ids: list[int]) -> None:
+        """Save graph to DB, converting indices to doc_ids for persistence."""
         cursor.execute("DELETE FROM hnsw_edges")
         rows = []
         for layer, nodes in self._graph.items():
-            for src_id, neighbors in nodes.items():
-                for dst_id in neighbors:
-                    rows.append((layer, src_id, dst_id))
+            for src_idx, neighbor_indices in nodes.items():
+                src_id = doc_ids[src_idx]
+                for dst_idx in neighbor_indices:
+                    rows.append((layer, src_id, doc_ids[dst_idx]))
         if rows:
             cursor.executemany(
                 "INSERT INTO hnsw_edges (layer, src_id, dst_id) VALUES (?, ?, ?)",
@@ -360,18 +343,25 @@ class HNSWStrategy:
             )
 
     def _load_graph(self, cursor: sqlite3.Cursor) -> None:
-        """Load graph from database into memory."""
+        """Load graph from DB, converting doc_ids back to indices."""
         self._graph = {}
         cursor.execute("SELECT layer, src_id, dst_id FROM hnsw_edges")
         for row in cursor.fetchall():
             layer = row["layer"]
-            src_id = row["src_id"]
-            dst_id = row["dst_id"]
+            src_idx = self._id_to_idx[row["src_id"]]
+            dst_idx = self._id_to_idx[row["dst_id"]]
             if layer not in self._graph:
                 self._graph[layer] = {}
-            if src_id not in self._graph[layer]:
-                self._graph[layer][src_id] = []
-            self._graph[layer][src_id].append(dst_id)
+            if src_idx not in self._graph[layer]:
+                self._graph[layer][src_idx] = []
+            self._graph[layer][src_idx].append(dst_idx)
+
+        # Also rebuild node_layers from graph structure
+        for layer in self._graph:
+            for idx in self._graph[layer]:
+                if idx not in self._node_layers or layer > self._node_layers[idx]:
+                    self._node_layers[idx] = layer
+
         self._graph_loaded = True
 
     @staticmethod
