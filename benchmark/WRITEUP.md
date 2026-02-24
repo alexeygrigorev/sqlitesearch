@@ -11,7 +11,7 @@ sqlitesearch is designed for small, local projects — no servers, no dependenci
 | Vector search | up to 100K | HNSW | Best — 0.97 recall, 5ms, 209 QPS |
 | Vector search | up to 100K | IVF | Good — 0.86 recall, 29ms, 35 QPS |
 | Vector search | up to 100K | LSH | OK — 0.89 recall with n_probe=2, 181ms |
-| Vector search | 1M | IVF | Usable — 0.92 recall, 219ms, 6 min build |
+| Vector search | 1M | IVF | Usable — 0.92 recall@100, 219ms, 6 min build |
 | Vector search | 1M | HNSW | Fast search (2ms) but slow build (21+ min) |
 | Vector search | 1M | LSH | Too slow — max 0.82 recall at 4s latency |
 
@@ -143,7 +143,7 @@ QdrantCloud-16c64g                1,242      6.4   0.9470
 Pinecone-p2.x8                    1,147     13.7   0.9260
 ----------------------------------------------------------
 sqlitesearch HNSW-fast [1M]         499      2.9   0.7023
-sqlitesearch IVF/16p [1M]           4.6    396.0   0.8602
+sqlitesearch IVF/16p [1M]           4.6    296.0   0.9228
 sqlitesearch HNSW [100K]            209      5.5   0.9731
 sqlitesearch IVF/16p [100K]          35     56.2   0.8602
 sqlitesearch LSH/p2 [100K]            6    227.2   0.8897
@@ -185,11 +185,10 @@ IVF clusters vectors using k-means, then at query time searches only the nearest
 
 | Config | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
 |--------|------|-------|-------------|-------------|-----|-------|---------|
-| IVF 4 probes | 0.799 | 0.619 | 124ms | 345ms | 8.1 | 368s | 3,987 MB |
-| IVF 8 probes | 0.852 | 0.746 | 124ms | 205ms | 8.1 | 367s | 3,987 MB |
-| IVF 16 probes | 0.922 | 0.860 | 219ms | 396ms | 4.6 | 373s | 3,987 MB |
+| IVF 8 probes | 0.889 | 0.851 | 124ms | 175ms | 8.1 | 369s | 3,974 MB |
+| IVF 16 probes | 0.944 | 0.923 | 219ms | 296ms | 4.6 | 368s | 3,974 MB |
 
-IVF is the best mode for 1M: 6-minute build, 0.86-0.92 recall, and reasonable latency. The k-means build is fast because it's pure numpy vectorized.
+IVF is the best mode for 1M: 6-minute build, 0.85-0.92 recall, and reasonable latency. The k-means build is fast because it's pure numpy vectorized.
 
 ```python
 # IVF with 16 probe clusters (best recall)
@@ -252,13 +251,13 @@ At 100K, HNSW dominates: highest recall with lowest latency. IVF offers a good b
 
 | Mode | Config | R@10 | R@100 | Latency | QPS | Build | DB |
 |------|--------|------|-------|---------|-----|-------|----|
-| IVF | 16 probes | **0.922** | **0.860** | 219ms | 4.6 | **373s** | 3,987 MB |
-| IVF | 8 probes | 0.852 | 0.746 | 124ms | 8.1 | 367s | 3,987 MB |
+| IVF | 16 probes | **0.944** | **0.923** | 219ms | 4.6 | **368s** | 3,974 MB |
+| IVF | 8 probes | 0.889 | 0.851 | 124ms | 8.1 | 369s | 3,974 MB |
 | HNSW-fast | ef_s=100 | 0.723 | 0.702 | **2.0ms** | **499** | 1285s | 5,196 MB |
 | HNSW-fast | ef_s=50 | 0.661 | 0.439 | 1.2ms | 854 | 1294s | 5,196 MB |
 | LSH | 64t/8b | 0.950 | 0.810 | 3993ms | 0.3 | 567s | 8,300 MB |
 
-At 1M, IVF is the recommended mode: best recall with reasonable latency and the fastest build. HNSW has the fastest search but lower recall with fast-build settings and much longer build times. LSH is impractical at this scale.
+At 1M, IVF is the recommended mode: best recall (0.92) with reasonable latency and the fastest build (6 min). HNSW has the fastest search (2ms) but lower recall with fast-build settings and much longer build times. LSH is impractical at this scale.
 
 ---
 
