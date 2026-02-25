@@ -8,11 +8,11 @@ sqlitesearch is designed for small, local projects — no servers, no dependenci
 |----------|------:|------|---------|
 | Text search | up to 125K docs | — | Excellent — 2.4x faster than minsearch |
 | Text search | 291K docs | — | Works but slower (11 QPS) |
-| Vector search | up to 100K | HNSW | Best — 0.97 recall, 5ms, 209 QPS |
+| Vector search | up to 100K | HNSW | Best — 0.94 recall, 5.5ms, 181 QPS |
 | Vector search | up to 100K | IVF | Good — 0.86 recall, 29ms, 35 QPS |
 | Vector search | up to 100K | LSH | OK — 0.89 recall with n_probe=2, 181ms |
-| Vector search | 1M | IVF | Usable — 0.92 recall@100, 219ms, 6 min build |
-| Vector search | 1M | HNSW | Fast search (2ms) but slow build (21+ min) |
+| Vector search | 1M | HNSW | Best — 0.85 recall, 6ms, 164 QPS, 10.5 min build |
+| Vector search | 1M | IVF | Good — 0.92 recall@100, 219ms, 6 min build |
 | Vector search | 1M | LSH | Too slow — max 0.82 recall at 4s latency |
 
 ---
@@ -142,9 +142,9 @@ ElasticCloud-8c60g-fm             1,925     11.3   0.8960
 QdrantCloud-16c64g                1,242      6.4   0.9470
 Pinecone-p2.x8                    1,147     13.7   0.9260
 ----------------------------------------------------------
-sqlitesearch HNSW-fast [1M]         499      2.9   0.7023
+sqlitesearch HNSW [1M]              164      7.1   0.8510
 sqlitesearch IVF/16p [1M]           4.6    296.0   0.9228
-sqlitesearch HNSW [100K]            209      5.5   0.9731
+sqlitesearch HNSW [100K]            181      6.0   0.9370
 sqlitesearch IVF/16p [100K]          35     56.2   0.8602
 sqlitesearch LSH/p2 [100K]            6    227.2   0.8897
 ```
@@ -188,7 +188,7 @@ IVF clusters vectors using k-means, then at query time searches only the nearest
 | IVF 8 probes | 0.889 | 0.851 | 124ms | 175ms | 8.1 | 369s | 3,974 MB |
 | IVF 16 probes | 0.944 | 0.923 | 219ms | 296ms | 4.6 | 368s | 3,974 MB |
 
-IVF is the best mode for 1M: 6-minute build, 0.85-0.92 recall, and reasonable latency. The k-means build is fast because it's pure numpy vectorized.
+IVF has the fastest build at 1M (6 min) and highest recall (0.92), but higher latency than HNSW. The k-means build is fast because it's pure numpy vectorized.
 
 ```python
 # IVF with 16 probe clusters (best recall)
@@ -202,34 +202,37 @@ index = VectorSearchIndex(mode="ivf", n_probe_clusters=8, db_path="vectors.db")
 
 ## HNSW (Hierarchical Navigable Small World)
 
-HNSW builds a multi-layer proximity graph for fast approximate nearest neighbor search. The graph is stored in SQLite but loaded into memory on first search. Parameters:
+HNSW builds a multi-layer proximity graph for fast approximate nearest neighbor search. The graph is stored in SQLite (as BLOBs) but loaded into memory on first search. Parameters:
 - `m`: max connections per node (higher = better recall, slower build, larger DB)
 - `ef_construction`: beam width during graph building (higher = better graph quality, slower build)
 - `ef_search`: beam width during search (higher = better recall, slower search)
+
+Build optimization: reverse edges use an overflow buffer that is periodically pruned when full, maintaining graph quality during construction without the cost of per-edge pruning. For datasets >500K, NN-descent refinement is skipped since the periodic pruning produces a well-structured graph on its own.
 
 ### HNSW results at 100K (Cohere 768d)
 
 | Config | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
 |--------|------|-------|-------------|-------------|-----|-------|---------|
-| m16/ef_c200/ef_s50 | 0.898 | 0.497 | 2.1ms | 2.6ms | 482 | 473s | 547 MB |
-| m16/ef_c200/ef_s100 | 0.918 | 0.887 | 2.2ms | 2.8ms | 456 | 453s | 547 MB |
-| m32/ef_c200/ef_s200 | 0.971 | 0.973 | 4.8ms | 5.5ms | 209 | 756s | 696 MB |
+| m16/ef_c16/ef_s200 | 0.900 | 0.896 | 3.8ms | 4.2ms | 260 | 69s | 537 MB |
+| m16/ef_c16/ef_s300 | 0.918 | 0.917 | 5.6ms | 6.5ms | 179 | 69s | 537 MB |
+| m16/ef_c64/ef_s200 | 0.928 | 0.917 | 3.9ms | 4.3ms | 260 | 161s | 547 MB |
+| m16/ef_c64/ef_s300 | 0.939 | 0.937 | 5.5ms | 6.0ms | 181 | 161s | 547 MB |
 
-### HNSW results at 1M (Cohere 768d, fast-build: m=12, ef_construction=32)
+### HNSW results at 1M (Cohere 768d)
 
 | Config | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
 |--------|------|-------|-------------|-------------|-----|-------|---------|
-| ef_search=50 | 0.661 | 0.439 | 1.2ms | 2.1ms | 854 | 1294s | 5,196 MB |
-| ef_search=100 | 0.723 | 0.702 | 2.0ms | 2.9ms | 499 | 1285s | 5,196 MB |
+| m16/ef_c16/ef_s200 | 0.836 | 0.821 | 4.2ms | 4.9ms | 237 | 628s | 4,070 MB |
+| m16/ef_c16/ef_s300 | 0.847 | 0.851 | 6.1ms | 7.1ms | 164 | 627s | 4,070 MB |
 
-HNSW excels at search speed (1-5ms) but the pure-Python graph build is slow at scale. At 100K, the high-quality config (m32/ef200) achieves 0.97 recall with 5ms latency. At 1M, the fast-build config needs ~21 min to build and achieves 0.70 recall. The high-quality 1M build would take 1-2 hours.
+HNSW excels at search speed (4-6ms) with good recall. At 100K, ef_c=64 achieves 0.94 recall with 5.5ms latency. At 1M, the fast-build config (ef_c=16) builds in 10.5 min with 0.85 recall and 6ms latency — 40x faster search than IVF at similar recall.
 
 ```python
-# HNSW high quality (best for ≤100K)
-index = VectorSearchIndex(mode="hnsw", m=32, ef_construction=200, ef_search=200, db_path="vectors.db")
+# HNSW balanced (best recall/speed at ≤100K)
+index = VectorSearchIndex(mode="hnsw", ef_construction=64, ef_search=300, db_path="vectors.db")
 
-# HNSW fast build (for larger datasets)
-index = VectorSearchIndex(mode="hnsw", m=12, ef_construction=32, ef_search=100, db_path="vectors.db")
+# HNSW fast build (for larger datasets, 10 min build at 1M)
+index = VectorSearchIndex(mode="hnsw", ef_construction=16, ef_search=300, db_path="vectors.db")
 ```
 
 ---
@@ -238,8 +241,8 @@ index = VectorSearchIndex(mode="hnsw", m=12, ef_construction=32, ef_search=100, 
 
 | Mode | Config | R@10 | R@100 | Latency | QPS | Build | DB |
 |------|--------|------|-------|---------|-----|-------|----|
-| HNSW | m32/ef200 | **0.971** | **0.973** | **4.8ms** | **209** | 756s | 696 MB |
-| HNSW | m16/ef100 | 0.918 | 0.887 | 2.2ms | 456 | 453s | 547 MB |
+| HNSW | ef_c64/ef_s300 | **0.939** | **0.937** | **5.5ms** | **181** | 161s | 547 MB |
+| HNSW | ef_c16/ef_s300 | 0.918 | 0.917 | 5.6ms | 179 | 69s | 537 MB |
 | IVF | 16 probes | 0.922 | 0.860 | 28.6ms | 35 | 39s | 399 MB |
 | IVF | 8 probes | 0.866 | 0.746 | 14.8ms | 68 | 36s | 399 MB |
 | LSH | n_probe=2 | 0.950 | 0.890 | 181ms | 6 | 9s | 466 MB |
@@ -253,11 +256,11 @@ At 100K, HNSW dominates: highest recall with lowest latency. IVF offers a good b
 |------|--------|------|-------|---------|-----|-------|----|
 | IVF | 16 probes | **0.944** | **0.923** | 219ms | 4.6 | **368s** | 3,974 MB |
 | IVF | 8 probes | 0.889 | 0.851 | 124ms | 8.1 | 369s | 3,974 MB |
-| HNSW-fast | ef_s=100 | 0.723 | 0.702 | **2.0ms** | **499** | 1285s | 5,196 MB |
-| HNSW-fast | ef_s=50 | 0.661 | 0.439 | 1.2ms | 854 | 1294s | 5,196 MB |
+| HNSW | ef_s=300 | 0.847 | 0.851 | **6.1ms** | **164** | 628s | 4,070 MB |
+| HNSW | ef_s=200 | 0.836 | 0.821 | 4.2ms | 237 | 628s | 4,070 MB |
 | LSH | 64t/8b | 0.950 | 0.810 | 3993ms | 0.3 | 567s | 8,300 MB |
 
-At 1M, IVF is the recommended mode: best recall (0.92) with reasonable latency and the fastest build (6 min). HNSW has the fastest search (2ms) but lower recall with fast-build settings and much longer build times. LSH is impractical at this scale.
+At 1M, the choice depends on your priority. HNSW is best for low-latency search: 0.85 recall at 6ms (164 QPS), 40x faster than IVF. IVF is best for highest recall: 0.92 at 219ms with the fastest build (6 min). LSH is impractical at this scale.
 
 ---
 
