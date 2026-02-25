@@ -150,30 +150,20 @@ class HNSWStrategy:
         gen = 0
 
         # Sequential HNSW insertion with periodic overflow pruning
-        import time as _time
-        _t0 = _time.perf_counter()
         for idx in range(n):
             gen = self._insert_node_fast(idx, rng, vecs, adj_width,
                                          visited_gen, gen)
-        _t1 = _time.perf_counter()
 
         # Batch prune any remaining overflow neighbors
         self._batch_prune(vecs)
-        _t2 = _time.perf_counter()
 
         # NN-descent refinement to improve graph quality
         # Skip for large datasets — periodic overflow pruning maintains quality
         if 100 < n <= 500_000:
             self._refine_graph(vecs, n_iters=1)
-        _t3 = _time.perf_counter()
 
         self._save_graph(cursor, doc_ids)
-        _t4 = _time.perf_counter()
         self.save_params(cursor)
-
-        if n >= 10000:
-            print(f"  HNSW build phases: insert={_t1-_t0:.1f}s  prune={_t2-_t1:.1f}s  "
-                  f"refine={_t3-_t2:.1f}s  save={_t4-_t3:.1f}s  total={_t4-_t0:.1f}s")
 
     def add_to_index(self, cursor: sqlite3.Cursor, vectors: np.ndarray, doc_ids: list[int]) -> None:
         """Incrementally add nodes to HNSW graph."""
