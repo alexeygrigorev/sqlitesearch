@@ -151,13 +151,14 @@ CONFIGS = [
     {"mode": "ivf", "label": "IVF auto/4p", "n_probe_clusters": 4},
     {"mode": "ivf", "label": "IVF auto/8p", "n_probe_clusters": 8},
     {"mode": "ivf", "label": "IVF auto/16p", "n_probe_clusters": 16},
-    # HNSW configs (high quality, slow build)
-    {"mode": "hnsw", "label": "HNSW m16/ef50", "m": 16, "ef_construction": 200, "ef_search": 50},
-    {"mode": "hnsw", "label": "HNSW m16/ef100", "m": 16, "ef_construction": 200, "ef_search": 100},
-    {"mode": "hnsw", "label": "HNSW m32/ef200", "m": 32, "ef_construction": 200, "ef_search": 200},
-    # HNSW configs (fast build for large datasets)
-    {"mode": "hnsw", "label": "HNSW-fast ef50", "m": 12, "ef_construction": 32, "ef_search": 50},
-    {"mode": "hnsw", "label": "HNSW-fast ef100", "m": 12, "ef_construction": 32, "ef_search": 100},
+    # HNSW default (m=20, ef_c=64)
+    {"mode": "hnsw", "label": "HNSW ef200"},
+    {"mode": "hnsw", "label": "HNSW ef300", "ef_search": 300},
+    {"mode": "hnsw", "label": "HNSW ef500", "ef_search": 500},
+    # HNSW fast build (ef_c=16)
+    {"mode": "hnsw", "label": "HNSW-fast ef200", "ef_construction": 16},
+    {"mode": "hnsw", "label": "HNSW-fast ef300", "ef_construction": 16, "ef_search": 300},
+    {"mode": "hnsw", "label": "HNSW-fast ef500", "ef_construction": 16, "ef_search": 500},
 ]
 
 

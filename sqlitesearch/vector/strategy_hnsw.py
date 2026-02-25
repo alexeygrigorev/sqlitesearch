@@ -21,9 +21,9 @@ class HNSWStrategy:
 
     def __init__(
         self,
-        m: int = 16,
-        ef_construction: int = 200,
-        ef_search: int = 50,
+        m: int = 20,
+        ef_construction: int = 64,
+        ef_search: int = 200,
         seed: Optional[int] = None,
     ):
         self.m = m
