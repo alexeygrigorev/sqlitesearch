@@ -67,72 +67,36 @@ Cohere Wikipedia-22-12 Medium (1M) — 768-dimensional embeddings of English Wik
   - `s3://assets.zilliz.com/benchmark/cohere_medium_1m/neighbors.parquet` — pre-computed ground truth (top-100 neighbors)
 - Dimensions: 768 (float32)
 - Similarity metric: Cosine
-- Download: The benchmark script expects files at `/tmp/vectordb_bench/dataset/cohere_medium_1m/`. Use the download function in `bench_vdbbench.py` or download manually with [s3fs](https://pypi.org/project/s3fs/) / AWS CLI. This is the same dataset used by the [VDBBench leaderboard](https://zilliz.com/vdbbench-leaderboard)
+- Download: The benchmark script expects files at `/tmp/vectordb_bench/dataset/cohere_medium_1m/`. Use the download function in `bench_vdbbench.py` or download manually with [s3fs](https://pypi.org/project/s3fs/) / AWS CLI.
 
-### How multi-probe LSH works
+### Results at 100K
 
-Standard LSH hashes each vector into a bucket per table using random projections. At query time, it looks up the query's exact bucket in each table. The problem: with 16 hash bits, there are 65,536 possible buckets per table, and two similar vectors (cosine similarity 0.9) only have ~8.7% chance of landing in the same bucket. Even with 8 tables, there's a ~50% chance of missing a true nearest neighbor entirely — and much worse for the top-100.
+| Mode | Config | R@10 | R@100 | Latency | QPS | Build | DB |
+|------|--------|-----:|------:|--------:|----:|------:|---:|
+| HNSW | ef_c64/ef_s300 | **0.939** | **0.937** | **5.5ms** | **181** | 161s | 547 MB |
+| HNSW | ef_c16/ef_s300 | 0.918 | 0.917 | 5.6ms | 179 | 69s | 537 MB |
+| IVF | 16 probes | 0.922 | 0.860 | 28.6ms | 35 | 39s | 399 MB |
+| IVF | 8 probes | 0.866 | 0.746 | 14.8ms | 68 | 36s | 399 MB |
+| LSH | n_probe=2 | 0.950 | 0.890 | 181ms | 6 | 9s | 466 MB |
+| LSH | 32t/16b/p1 | 0.990 | 0.960 | 209ms | 5 | — | — |
 
-Multi-probe LSH fixes this by also checking neighboring buckets. Instead of looking up just the query's exact hash, it flips 1 or 2 bits and checks those buckets too. With `n_probe=2` (flip up to 2 bits), each table checks 1 + 16 + 120 = 137 buckets instead of 1. This raises the probability of finding a neighbor with cosine similarity 0.9 from ~50% to ~99%.
+At 100K, HNSW dominates: highest recall with lowest latency. IVF offers a good balance with fast builds. LSH has the fastest build but slowest search.
 
-The tradeoff is more candidates to rerank. To keep reranking fast, vectors are cached in a numpy array in memory (loaded once from SQLite on first search), so the cosine similarity computation is a single matrix-vector multiply — essentially free compared to the SQL lookup.
+### Results at 1M
 
-### Results (seed=42, default: 8 tables, 16 hash bits, n_probe=0)
+| Mode | Config | R@10 | R@100 | Latency | QPS | Build | DB |
+|------|--------|-----:|------:|--------:|----:|------:|---:|
+| HNSW | ef_s=300 | 0.907 | 0.891 | **6.3ms** | **158** | 639s | 4,099 MB |
+| HNSW | ef_s=1000 | 0.953 | 0.945 | 28.1ms | 36 | 639s | 4,099 MB |
+| IVF | 16 probes | **0.944** | **0.923** | 219ms | 4.6 | **368s** | 3,974 MB |
+| IVF | 8 probes | 0.889 | 0.851 | 124ms | 8.1 | 369s | 3,974 MB |
+| LSH | 64t/8b | 0.950 | 0.810 | 3,993ms | 0.3 | 567s | 8,300 MB |
 
-| N vectors | Insert | vec/s | Recall@10 | Recall@100 | Avg lat | P99 lat | QPS | DB size |
-|----------:|-------:|------:|----------:|-----------:|--------:|--------:|----:|--------:|
-| 1,000 | 0.13s | 7,944 | 0.29 | 0.13 | 0.5ms | 0.9ms | 2,152 | 5 MB |
-| 10,000 | 0.86s | 11,695 | 0.31 | 0.19 | 6.2ms | 19.5ms | 162 | 47 MB |
-| 100,000 | 8.90s | 11,233 | 0.29 | 0.20 | 15.6ms | — | 64 | 466 MB |
-| 1,000,000 | 123s | 8,221 | 0.31 | 0.23 | 128ms | — | 8 | 4,666 MB |
-
-With the default n_probe=0, recall is low but latency is fast. Setting n_probe=2 trades latency for much higher recall (see tuning section below).
-
-### Recall tuning at 100K
-
-Recall depends on three LSH parameters: `n_tables`, `hash_size`, and `n_probe`. Tested on 100K Cohere vectors (768d) with brute-force ground truth:
-
-| n_tables | hash_size | n_probe | Recall@10 | Recall@100 | Latency | QPS |
-|---------:|----------:|--------:|----------:|-----------:|--------:|----:|
-| 8 (default) | 16 | 0 | 0.29 | 0.20 | 16ms | 64 |
-| 8 | 16 | 1 | 0.83 | 0.70 | 88ms | 11 |
-| 8 | 16 | 2 | 0.95 | 0.89 | 181ms | 6 |
-| 16 | 16 | 1 | 0.95 | 0.87 | 151ms | 7 |
-| 16 | 16 | 2 | 0.99 | 0.95 | 258ms | 4 |
-| 32 | 16 | 1 | 0.99 | 0.96 | 209ms | 5 |
-
-```python
-# Default: fast, low recall
-index = VectorSearchIndex(db_path="vectors.db")
-
-# Better recall (0.89 at 100K)
-index = VectorSearchIndex(n_probe=2, db_path="vectors.db")
-
-# Best recall (0.95 at 100K, slower inserts, larger DB)
-index = VectorSearchIndex(n_tables=16, n_probe=2, db_path="vectors.db")
-```
-
-### Recall tuning at 1M (n_probe=0 only)
-
-At 1M, we tested whether more tables and fewer hash bits can compensate for no multi-probe. All configs use n_probe=0:
-
-| n_tables | hash_size | Recall@10 | Recall@100 | Latency | QPS | Insert | DB size |
-|---------:|----------:|----------:|-----------:|--------:|----:|-------:|--------:|
-| 8 | 16 | 0.31 | 0.23 | 128ms | 8 | 123s | 4.7 GB |
-| 8 | 10 | 0.38 | 0.28 | 418ms | 2 | 87s | 4.5 GB |
-| 8 | 8 | 0.41 | 0.28 | 618ms | 2 | 82s | 4.5 GB |
-| 16 | 8 | 0.57 | 0.42 | 1,089ms | 1 | 135s | 5.0 GB |
-| 32 | 8 | 0.78 | 0.60 | 2,100ms | 0.5 | 258s | 6.1 GB |
-| 32 | 6 | 0.78 | 0.62 | 3,197ms | 0.3 | 221s | 5.9 GB |
-| 64 | 10 | 0.90 | 0.76 | 2,327ms | 0.4 | 808s | 8.7 GB |
-| 64 | 8 | 0.95 | 0.81 | 3,993ms | 0.3 | 567s | 8.3 GB |
-| 64 | 6 | 0.94 | 0.82 | 6,450ms | 0.2 | 438s | 7.9 GB |
-
-Even with 64 tables and 6 hash bits, recall@100 tops out at 0.82 with 6.5s latency. Without multi-probe, you need so many tables that every query scans a large fraction of the dataset — at which point you've lost the benefit of LSH.
+HNSW is best for low-latency search: 0.89 recall at 6ms (158 QPS), 35x faster than IVF. With ef_search=1000, HNSW reaches 0.95 recall at 28ms (still 8x faster than IVF). IVF has the fastest build (6 min vs 10.5 min). LSH is impractical at this scale.
 
 ### VDBBench leaderboard comparison (Cohere-1M)
 
-Dataset: [Cohere Wikipedia-22-12 Medium](https://cohere.com/embed) (768d, cosine). Leaderboard data from [VDBBench](https://zilliz.com/vdbbench-leaderboard) at $1,000/month cost tier.
+Leaderboard data from [VDBBench](https://zilliz.com/vdbbench-leaderboard) at $1,000/month cost tier.
 
 | Database | QPS | P99 (ms) | Recall@100 |
 |----------|----:|--------:|-----------:|
@@ -154,53 +118,6 @@ Dataset: [Cohere Wikipedia-22-12 Medium](https://cohere.com/embed) (768d, cosine
 
 **Important differences**: VDBBench numbers are multi-process concurrent QPS on dedicated cloud hardware (8-16 cores, 32-128 GB RAM, ~$1,000/month). sqlitesearch is serial single-process in pure Python on a single machine — no server, no dependencies beyond numpy. QPS is not directly comparable; recall and per-query latency are more meaningful for comparison.
 
-### Vector search optimizations applied
-
-1. Multi-probe LSH — probe neighboring hash buckets (1-bit and 2-bit flips) to increase recall. `n_probe=2` probes 137 buckets per table instead of 1
-2. In-memory vector cache — vectors are cached in a numpy array after insert/load, eliminating SQLite I/O during reranking
-3. Per-table candidate queries — separate SQL query per hash table merged in Python (faster than one large OR query with GROUP BY)
-4. Vectorized batch hashing — single matmul for all vectors x all tables during insert
-5. Vectorized query hashing — single matmul for all tables during search
-6. Raw bytes instead of pickle — `tobytes()`/`frombuffer()` for vector storage
-7. Vectorized cosine reranking — matrix multiply + `argpartition` for top-K
-8. Chunked IN-queries — avoids SQLite variable limit for large candidate sets
-9. Multi-probe candidate cap — limits reranking to top 50K candidates by table-hit count
-
-### Why LSH doesn't scale to 1M
-
-At 1M with 768 dimensions, LSH with random projections reaches its limits. The top-100 nearest neighbors often have moderate cosine similarity (0.6-0.8), where the probability of landing in the same or nearby hash bucket is low even with multi-probe. Without multi-probe, getting competitive recall requires 64 tables and small hash sizes, which makes every query scan a large fraction of the dataset (6+ seconds per query, 8+ GB database).
-
----
-
-## IVF (Inverted File Index)
-
-IVF clusters vectors using k-means, then at query time searches only the nearest clusters. Number of clusters auto-scales as `min(sqrt(n), 256)`. The `n_probe_clusters` parameter controls how many clusters are searched (tradeoff: more probes = higher recall, slower search).
-
-### IVF results at 100K (Cohere 768d)
-
-| Config | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
-|--------|------|-------|-------------|-------------|-----|-------|---------|
-| IVF 4 probes | 0.755 | 0.603 | 9.0ms | 32.6ms | 111 | 36s | 399 MB |
-| IVF 8 probes | 0.866 | 0.746 | 14.8ms | 32.0ms | 68 | 36s | 399 MB |
-| IVF 16 probes | 0.922 | 0.860 | 28.6ms | 56.2ms | 35 | 39s | 399 MB |
-
-### IVF results at 1M (Cohere 768d)
-
-| Config | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
-|--------|------|-------|-------------|-------------|-----|-------|---------|
-| IVF 8 probes | 0.889 | 0.851 | 124ms | 175ms | 8.1 | 369s | 3,974 MB |
-| IVF 16 probes | 0.944 | 0.923 | 219ms | 296ms | 4.6 | 368s | 3,974 MB |
-
-IVF has the fastest build at 1M (6 min) and highest recall (0.92), but higher latency than HNSW. The k-means build is fast because it's pure numpy vectorized.
-
-```python
-# IVF with 16 probe clusters (best recall)
-index = VectorSearchIndex(mode="ivf", n_probe_clusters=16, db_path="vectors.db")
-
-# IVF with 8 probes (balanced)
-index = VectorSearchIndex(mode="ivf", n_probe_clusters=8, db_path="vectors.db")
-```
-
 ---
 
 ## HNSW (Hierarchical Navigable Small World)
@@ -212,7 +129,7 @@ HNSW builds a multi-layer proximity graph for fast approximate nearest neighbor 
 
 Build optimization: reverse edges use an overflow buffer that is periodically pruned when full, maintaining graph quality during construction without the cost of per-edge pruning. For datasets >500K, NN-descent refinement is skipped since the periodic pruning produces a well-structured graph on its own.
 
-### HNSW results at 100K (Cohere 768d)
+### HNSW tuning at 100K (Cohere 768d)
 
 | Config | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
 |--------|------|-------|-------------|-------------|-----|-------|---------|
@@ -221,7 +138,7 @@ Build optimization: reverse edges use an overflow buffer that is periodically pr
 | m16/ef_c64/ef_s200 | 0.928 | 0.917 | 3.9ms | 4.3ms | 260 | 161s | 547 MB |
 | m16/ef_c64/ef_s300 | 0.939 | 0.937 | 5.5ms | 6.0ms | 181 | 161s | 547 MB |
 
-### HNSW results at 1M (Cohere 768d, m=20, ef_construction=16)
+### HNSW tuning at 1M (Cohere 768d, m=20, ef_construction=16)
 
 | ef_search | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
 |-----------|------|-------|-------------|-------------|-----|-------|---------|
@@ -245,30 +162,117 @@ index = VectorSearchIndex(mode="hnsw", ef_construction=16, db_path="vectors.db")
 
 ---
 
-## Mode comparison at 100K
+## IVF (Inverted File Index)
 
-| Mode | Config | R@10 | R@100 | Latency | QPS | Build | DB |
-|------|--------|------|-------|---------|-----|-------|----|
-| HNSW | ef_c64/ef_s300 | **0.939** | **0.937** | **5.5ms** | **181** | 161s | 547 MB |
-| HNSW | ef_c16/ef_s300 | 0.918 | 0.917 | 5.6ms | 179 | 69s | 537 MB |
-| IVF | 16 probes | 0.922 | 0.860 | 28.6ms | 35 | 39s | 399 MB |
-| IVF | 8 probes | 0.866 | 0.746 | 14.8ms | 68 | 36s | 399 MB |
-| LSH | n_probe=2 | 0.950 | 0.890 | 181ms | 6 | 9s | 466 MB |
-| LSH | 32t/16b/p1 | 0.990 | 0.960 | 209ms | 5 | — | — |
+IVF clusters vectors using k-means, then at query time searches only the nearest clusters. Number of clusters auto-scales as `min(sqrt(n), 256)`. The `n_probe_clusters` parameter controls how many clusters are searched (tradeoff: more probes = higher recall, slower search).
 
-At 100K, HNSW dominates: highest recall with lowest latency. IVF offers a good balance with fast builds. LSH has the fastest build but slowest search.
+### IVF tuning at 100K (Cohere 768d)
 
-## Mode comparison at 1M
+| Config | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
+|--------|------|-------|-------------|-------------|-----|-------|---------|
+| IVF 4 probes | 0.755 | 0.603 | 9.0ms | 32.6ms | 111 | 36s | 399 MB |
+| IVF 8 probes | 0.866 | 0.746 | 14.8ms | 32.0ms | 68 | 36s | 399 MB |
+| IVF 16 probes | 0.922 | 0.860 | 28.6ms | 56.2ms | 35 | 39s | 399 MB |
 
-| Mode | Config | R@10 | R@100 | Latency | QPS | Build | DB |
-|------|--------|------|-------|---------|-----|-------|----|
-| IVF | 16 probes | **0.944** | **0.923** | 219ms | 4.6 | **368s** | 3,974 MB |
-| IVF | 8 probes | 0.889 | 0.851 | 124ms | 8.1 | 369s | 3,974 MB |
-| HNSW | ef_s=300 | 0.907 | 0.891 | **6.3ms** | **158** | 639s | 4,099 MB |
-| HNSW | ef_s=200 | 0.886 | 0.862 | 4.4ms | 229 | 639s | 4,099 MB |
-| LSH | 64t/8b | 0.950 | 0.810 | 3993ms | 0.3 | 567s | 8,300 MB |
+### IVF tuning at 1M (Cohere 768d)
 
-At 1M, the choice depends on your priority. HNSW is best for low-latency search: 0.89 recall at 6ms (158 QPS), 35x faster than IVF. With ef_search=1000, HNSW reaches 0.95 recall at 28ms (still 8x faster than IVF). IVF has the fastest build (6 min vs 10.5 min). LSH is impractical at this scale.
+| Config | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
+|--------|------|-------|-------------|-------------|-----|-------|---------|
+| IVF 8 probes | 0.889 | 0.851 | 124ms | 175ms | 8.1 | 369s | 3,974 MB |
+| IVF 16 probes | 0.944 | 0.923 | 219ms | 296ms | 4.6 | 368s | 3,974 MB |
+
+IVF has the fastest build at 1M (6 min) and highest recall (0.92), but higher latency than HNSW. The k-means build is fast because it's pure numpy vectorized.
+
+```python
+# IVF with 16 probe clusters (best recall)
+index = VectorSearchIndex(mode="ivf", n_probe_clusters=16, db_path="vectors.db")
+
+# IVF with 8 probes (balanced)
+index = VectorSearchIndex(mode="ivf", n_probe_clusters=8, db_path="vectors.db")
+```
+
+---
+
+## LSH (Locality-Sensitive Hashing)
+
+### How multi-probe LSH works
+
+Standard LSH hashes each vector into a bucket per table using random projections. At query time, it looks up the query's exact bucket in each table. The problem: with 16 hash bits, there are 65,536 possible buckets per table, and two similar vectors (cosine similarity 0.9) only have ~8.7% chance of landing in the same bucket. Even with 8 tables, there's a ~50% chance of missing a true nearest neighbor entirely — and much worse for the top-100.
+
+Multi-probe LSH fixes this by also checking neighboring buckets. Instead of looking up just the query's exact hash, it flips 1 or 2 bits and checks those buckets too. With `n_probe=2` (flip up to 2 bits), each table checks 1 + 16 + 120 = 137 buckets instead of 1. This raises the probability of finding a neighbor with cosine similarity 0.9 from ~50% to ~99%.
+
+The tradeoff is more candidates to rerank. To keep reranking fast, vectors are cached in a numpy array in memory (loaded once from SQLite on first search), so the cosine similarity computation is a single matrix-vector multiply — essentially free compared to the SQL lookup.
+
+### LSH scaling (seed=42, default: 8 tables, 16 hash bits, n_probe=0)
+
+| N vectors | Insert | vec/s | Recall@10 | Recall@100 | Avg lat | P99 lat | QPS | DB size |
+|----------:|-------:|------:|----------:|-----------:|--------:|--------:|----:|--------:|
+| 1,000 | 0.13s | 7,944 | 0.29 | 0.13 | 0.5ms | 0.9ms | 2,152 | 5 MB |
+| 10,000 | 0.86s | 11,695 | 0.31 | 0.19 | 6.2ms | 19.5ms | 162 | 47 MB |
+| 100,000 | 8.90s | 11,233 | 0.29 | 0.20 | 15.6ms | — | 64 | 466 MB |
+| 1,000,000 | 123s | 8,221 | 0.31 | 0.23 | 128ms | — | 8 | 4,666 MB |
+
+With the default n_probe=0, recall is low but latency is fast. Setting n_probe=2 trades latency for much higher recall (see tuning below).
+
+### LSH tuning at 100K
+
+Recall depends on three LSH parameters: `n_tables`, `hash_size`, and `n_probe`. Tested on 100K Cohere vectors (768d) with brute-force ground truth:
+
+| n_tables | hash_size | n_probe | Recall@10 | Recall@100 | Latency | QPS |
+|---------:|----------:|--------:|----------:|-----------:|--------:|----:|
+| 8 (default) | 16 | 0 | 0.29 | 0.20 | 16ms | 64 |
+| 8 | 16 | 1 | 0.83 | 0.70 | 88ms | 11 |
+| 8 | 16 | 2 | 0.95 | 0.89 | 181ms | 6 |
+| 16 | 16 | 1 | 0.95 | 0.87 | 151ms | 7 |
+| 16 | 16 | 2 | 0.99 | 0.95 | 258ms | 4 |
+| 32 | 16 | 1 | 0.99 | 0.96 | 209ms | 5 |
+
+```python
+# Default: fast, low recall
+index = VectorSearchIndex(db_path="vectors.db")
+
+# Better recall (0.89 at 100K)
+index = VectorSearchIndex(n_probe=2, db_path="vectors.db")
+
+# Best recall (0.95 at 100K, slower inserts, larger DB)
+index = VectorSearchIndex(n_tables=16, n_probe=2, db_path="vectors.db")
+```
+
+### LSH tuning at 1M (n_probe=0 only)
+
+At 1M, we tested whether more tables and fewer hash bits can compensate for no multi-probe. All configs use n_probe=0:
+
+| n_tables | hash_size | Recall@10 | Recall@100 | Latency | QPS | Insert | DB size |
+|---------:|----------:|----------:|-----------:|--------:|----:|-------:|--------:|
+| 8 | 16 | 0.31 | 0.23 | 128ms | 8 | 123s | 4.7 GB |
+| 8 | 10 | 0.38 | 0.28 | 418ms | 2 | 87s | 4.5 GB |
+| 8 | 8 | 0.41 | 0.28 | 618ms | 2 | 82s | 4.5 GB |
+| 16 | 8 | 0.57 | 0.42 | 1,089ms | 1 | 135s | 5.0 GB |
+| 32 | 8 | 0.78 | 0.60 | 2,100ms | 0.5 | 258s | 6.1 GB |
+| 32 | 6 | 0.78 | 0.62 | 3,197ms | 0.3 | 221s | 5.9 GB |
+| 64 | 10 | 0.90 | 0.76 | 2,327ms | 0.4 | 808s | 8.7 GB |
+| 64 | 8 | 0.95 | 0.81 | 3,993ms | 0.3 | 567s | 8.3 GB |
+| 64 | 6 | 0.94 | 0.82 | 6,450ms | 0.2 | 438s | 7.9 GB |
+
+Even with 64 tables and 6 hash bits, recall@100 tops out at 0.82 with 6.5s latency.
+
+### Why LSH doesn't scale to 1M
+
+At 1M with 768 dimensions, LSH with random projections reaches its limits. The top-100 nearest neighbors often have moderate cosine similarity (0.6-0.8), where the probability of landing in the same or nearby hash bucket is low even with multi-probe. Without multi-probe, getting competitive recall requires 64 tables and small hash sizes, which makes every query scan a large fraction of the dataset (6+ seconds per query, 8+ GB database).
+
+---
+
+## Vector search optimizations applied
+
+1. Multi-probe LSH — probe neighboring hash buckets (1-bit and 2-bit flips) to increase recall. `n_probe=2` probes 137 buckets per table instead of 1
+2. In-memory vector cache — vectors are cached in a numpy array after insert/load, eliminating SQLite I/O during reranking
+3. Per-table candidate queries — separate SQL query per hash table merged in Python (faster than one large OR query with GROUP BY)
+4. Vectorized batch hashing — single matmul for all vectors x all tables during insert
+5. Vectorized query hashing — single matmul for all tables during search
+6. Raw bytes instead of pickle — `tobytes()`/`frombuffer()` for vector storage
+7. Vectorized cosine reranking — matrix multiply + `argpartition` for top-K
+8. Chunked IN-queries — avoids SQLite variable limit for large candidate sets
+9. Multi-probe candidate cap — limits reranking to top 50K candidates by table-hit count
 
 ---
 
