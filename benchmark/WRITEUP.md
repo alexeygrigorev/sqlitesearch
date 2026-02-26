@@ -269,22 +269,4 @@ At 1M, the choice depends on your priority. HNSW is best for low-latency search:
 
 ---
 
-## Running the benchmarks
-
-```bash
-# Vector search: compare all modes at 100K
-uv run python benchmark/bench_modes.py --n-vectors 100000
-
-# Vector search: HNSW recall/latency sweep at 1M
-uv run python benchmark/tune_hnsw_search.py --n-vectors 1000000 --ef-search 200 300 500 1000
-
-# Vector search: LSH parameter tuning
-uv run python benchmark/tune_recall.py --n-vectors 100000
-
-# Text search: local benchmark
-uv run python benchmark/run_benchmark.py -n 10000 -q 100
-```
-
-Vector benchmarks require the Cohere-1M dataset at `/tmp/vectordb_bench/dataset/cohere_medium_1m/`. See the Dataset section above for download details.
-
 All 124 tests pass after all optimizations (102 original + 11 IVF + 11 HNSW).
