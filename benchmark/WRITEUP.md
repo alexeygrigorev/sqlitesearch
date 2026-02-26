@@ -132,24 +132,27 @@ Even with 64 tables and 6 hash bits, recall@100 tops out at 0.82 with 6.5s laten
 
 ### VDBBench leaderboard comparison (Cohere-1M)
 
-```
-Database                            QPS  P99(ms)   Recall
-----------------------------------------------------------
-ZillizCloud-8cu-perf              9,704      2.5   0.9170
-Milvus-16c64g-sq8                 3,465      2.2   0.9530
-OpenSearch-16c128g-fm             3,055      7.2   0.9070
-ElasticCloud-8c60g-fm             1,925     11.3   0.8960
-QdrantCloud-16c64g                1,242      6.4   0.9470
-Pinecone-p2.x8                    1,147     13.7   0.9260
-----------------------------------------------------------
-sqlitesearch HNSW [1M]              158      7.5   0.8910
-sqlitesearch IVF/16p [1M]           4.6    296.0   0.9228
-sqlitesearch HNSW [100K]            181      6.0   0.9370
-sqlitesearch IVF/16p [100K]          35     56.2   0.8602
-sqlitesearch LSH/p2 [100K]            6    227.2   0.8897
-```
+Dataset: [Cohere Wikipedia-22-12 Medium](https://cohere.com/embed) (768d, cosine). Leaderboard data from [VDBBench](https://zilliz.com/vdbbench-leaderboard) at $1,000/month cost tier.
 
-Note: Leaderboard = multi-process on cloud hardware (8-16 cores, 32-128GB RAM). sqlitesearch = serial single-process in pure Python.
+| Database | QPS | P99 (ms) | Recall@100 |
+|----------|----:|--------:|-----------:|
+| ZillizCloud 8cu-perf | 9,704 | 2.5 | 0.917 |
+| Milvus 16c64g-sq8 | 3,465 | 2.2 | 0.953 |
+| OpenSearch 16c128g-fm | 3,055 | 7.2 | 0.907 |
+| ElasticCloud 8c60g-fm | 1,925 | 11.3 | 0.914 |
+| QdrantCloud 16c64g | 1,242 | 6.4 | 0.947 |
+| Pinecone p2.x8 | 1,147 | 13.7 | 0.926 |
+| OpenSearch 16c128g | 951 | 13.2 | 0.914 |
+| ElasticCloud 8c60g | 597 | 12.1 | 0.922 |
+| | | | |
+| **sqlitesearch HNSW** ef_s=300 [1M] | 158 | 7.5 | 0.891 |
+| **sqlitesearch HNSW** ef_s=1000 [1M] | 36 | 75.5 | 0.945 |
+| **sqlitesearch IVF** 16 probes [1M] | 4.6 | 296 | 0.923 |
+| **sqlitesearch HNSW** [100K] | 181 | 6.0 | 0.937 |
+| **sqlitesearch IVF** 16 probes [100K] | 35 | 56.2 | 0.860 |
+| **sqlitesearch LSH** n_probe=2 [100K] | 6 | 227 | 0.890 |
+
+**Important differences**: VDBBench numbers are multi-process concurrent QPS on dedicated cloud hardware (8-16 cores, 32-128 GB RAM, ~$1,000/month). sqlitesearch is serial single-process in pure Python on a single machine — no server, no dependencies beyond numpy. QPS is not directly comparable; recall and per-query latency are more meaningful for comparison.
 
 ### Vector search optimizations applied
 
