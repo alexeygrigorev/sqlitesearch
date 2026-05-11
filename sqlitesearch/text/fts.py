@@ -74,7 +74,7 @@ class TextSearchIndex:
         self.id_field = id_field
         self.db_path = db_path
         self.stemming = stemming
-        self.tokenizer = tokenizer if tokenizer is not None else Tokenizer(stop_words='english')
+        self.tokenizer = tokenizer if tokenizer is not None else Tokenizer(stop_words="english")
         self._local = threading.local()
 
         # Add id_field to keyword_fields if provided and not already there
@@ -155,13 +155,17 @@ class TextSearchIndex:
 
         conn.commit()
 
-    def _is_empty(self) -> bool:
-        """Check if the index is empty."""
+    def count(self) -> int:
+        """Return the number of documents in the index."""
         conn = self._get_conn()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) as count FROM docs")
         row = cursor.fetchone()
-        return row["count"] == 0
+        return row["count"]
+
+    def _is_empty(self) -> bool:
+        """Check if the index is empty."""
+        return self.count() == 0
 
     def fit(self, docs: list[dict[str, Any]]) -> "TextSearchIndex":
         """
@@ -208,17 +212,15 @@ class TextSearchIndex:
 
         # Build column lists including keyword, numeric, and date fields
         filter_cols = (
-            [f'"{field}"' for field in self.keyword_fields] +
-            [f'"{field}"' for field in self.numeric_fields] +
-            [f'"{field}"' for field in self.date_fields]
+            [f'"{field}"' for field in self.keyword_fields]
+            + [f'"{field}"' for field in self.numeric_fields]
+            + [f'"{field}"' for field in self.date_fields]
         )
         all_cols = ["doc_json"] + filter_cols
         col_names = ", ".join(all_cols)
         placeholders = ", ".join(["?"] * len(all_cols))
 
-        fts_col_names = ", ".join(
-            ["docid"] + [f'"{field}"' for field in self.text_fields]
-        )
+        fts_col_names = ", ".join(["docid"] + [f'"{field}"' for field in self.text_fields])
         fts_placeholders = ", ".join(["?"] * (1 + len(self.text_fields)))
 
         # Prepare all rows
@@ -247,9 +249,7 @@ class TextSearchIndex:
                     date_vals.append(value)
 
             doc_rows.append([doc_json] + keyword_vals + numeric_vals + date_vals)
-            fts_text_per_doc.append(
-                [str(doc.get(field, "")) for field in self.text_fields]
-            )
+            fts_text_per_doc.append([str(doc.get(field, "")) for field in self.text_fields])
 
         # Batch insert into docs table
         doc_insert_sql = f"INSERT INTO docs ({col_names}) VALUES ({placeholders})"
@@ -265,9 +265,7 @@ class TextSearchIndex:
         for i, fts_text in enumerate(fts_text_per_doc):
             fts_rows.append([first_id + i] + fts_text)
 
-        fts_insert_sql = (
-            f"INSERT INTO docs_fts ({fts_col_names}) VALUES ({fts_placeholders})"
-        )
+        fts_insert_sql = f"INSERT INTO docs_fts ({fts_col_names}) VALUES ({fts_placeholders})"
         cursor.executemany(fts_insert_sql, fts_rows)
 
         conn.commit()
@@ -431,7 +429,7 @@ class TextSearchIndex:
                 value = doc[field]
                 if isinstance(value, str):
                     # Check if string contains time component (has 'T' or ' ')
-                    has_time = 'T' in value or ' ' in value
+                    has_time = "T" in value or " " in value
 
                     if has_time:
                         # Parse as datetime
@@ -562,7 +560,8 @@ class TextSearchIndex:
             return tokens
         # Fallback: if all terms were stop words or empty, use raw terms
         import re
-        raw = re.findall(r'\w+', query.lower())
+
+        raw = re.findall(r"\w+", query.lower())
         return raw if raw else [query]
 
     def _escape_fts_query(self, query: str) -> str:

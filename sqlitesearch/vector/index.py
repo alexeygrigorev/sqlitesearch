@@ -83,11 +83,13 @@ class VectorSearchIndex:
             )
         elif mode_enum == VectorMode.IVF:
             from sqlitesearch.vector.strategy_ivf import IVFStrategy
+
             self._strategy = IVFStrategy(
                 n_clusters=n_clusters, n_probe_clusters=n_probe_clusters, seed=seed
             )
         elif mode_enum == VectorMode.HNSW:
             from sqlitesearch.vector.strategy_hnsw import HNSWStrategy
+
             self._strategy = HNSWStrategy(
                 m=m, ef_construction=ef_construction, ef_search=ef_search, seed=seed
             )
@@ -147,12 +149,17 @@ class VectorSearchIndex:
 
         conn.commit()
 
-    def _is_empty(self) -> bool:
+    def count(self) -> int:
+        """Return the number of documents in the index."""
         conn = self._get_conn()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) as count FROM docs")
         row = cursor.fetchone()
-        return row["count"] == 0
+        return row["count"]
+
+    def _is_empty(self) -> bool:
+        """Check if the index is empty."""
+        return self.count() == 0
 
     def fit(
         self,
@@ -249,9 +256,7 @@ class VectorSearchIndex:
                 else:
                     date_vals.append(value)
 
-            doc_rows.append(
-                [doc_json, vector_bytes] + keyword_vals + numeric_vals + date_vals
-            )
+            doc_rows.append([doc_json, vector_bytes] + keyword_vals + numeric_vals + date_vals)
 
         # Insert docs and collect IDs
         insert_sql = f"INSERT INTO docs ({col_names}) VALUES ({placeholders})"
@@ -388,15 +393,13 @@ class VectorSearchIndex:
                 if value is None:
                     rows = self._chunked_in_query(
                         cursor,
-                        f'SELECT id FROM docs WHERE id IN ({{placeholders}}) '
-                        f'AND "{field}" IS NULL',
+                        f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" IS NULL',
                         ids_list,
                     )
                 else:
                     rows = self._chunked_in_query(
                         cursor,
-                        f'SELECT id FROM docs WHERE id IN ({{placeholders}}) '
-                        f'AND "{field}" = ?',
+                        f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" = ?',
                         ids_list,
                         [value],
                     )
@@ -431,7 +434,7 @@ class VectorSearchIndex:
                 where_sql = " AND " + " AND ".join(where_conditions)
                 rows = self._chunked_in_query(
                     cursor,
-                    f'SELECT id FROM docs WHERE id IN ({{placeholders}}){where_sql}',
+                    f"SELECT id FROM docs WHERE id IN ({{placeholders}}){where_sql}",
                     ids_list,
                     extra_params,
                 )
@@ -474,7 +477,7 @@ class VectorSearchIndex:
                 where_sql = " AND " + " AND ".join(where_conditions)
                 rows = self._chunked_in_query(
                     cursor,
-                    f'SELECT id FROM docs WHERE id IN ({{placeholders}}){where_sql}',
+                    f"SELECT id FROM docs WHERE id IN ({{placeholders}}){where_sql}",
                     ids_list,
                     extra_params,
                 )
@@ -501,9 +504,7 @@ class VectorSearchIndex:
 
         if self._cached_vectors is not None and self._id_to_cache_idx is not None:
             cache_indices = [
-                self._id_to_cache_idx[did]
-                for did in candidate_ids
-                if did in self._id_to_cache_idx
+                self._id_to_cache_idx[did] for did in candidate_ids if did in self._id_to_cache_idx
             ]
             if not cache_indices:
                 return []
@@ -591,6 +592,7 @@ class VectorSearchIndex:
         """Give the strategy a reference to the vector cache if it needs one."""
         if hasattr(self._strategy, "_vectors") and self._cached_vectors is not None:
             from sqlitesearch.vector.strategy_hnsw import HNSWStrategy
+
             if isinstance(self._strategy, HNSWStrategy):
                 self._strategy._vectors = HNSWStrategy._normalize(self._cached_vectors)
                 self._strategy._doc_ids = self._cached_doc_ids
