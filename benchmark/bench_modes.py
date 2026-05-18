@@ -144,9 +144,9 @@ def run_config(train_embs, test_embs, ground_truth, mode, **kwargs):
 # Configurations to benchmark
 CONFIGS = [
     # LSH configs
-    {"mode": "lsh", "label": "LSH 8t/16b", "n_tables": 8, "hash_size": 16},
-    {"mode": "lsh", "label": "LSH 32t/8b", "n_tables": 32, "hash_size": 8},
-    {"mode": "lsh", "label": "LSH 64t/6b", "n_tables": 64, "hash_size": 6},
+    {"mode": "lsh", "label": "LSH 8t/16b/p2", "n_tables": 8, "hash_size": 16, "n_probe": 2},
+    {"mode": "lsh", "label": "LSH 32t/8b/p2", "n_tables": 32, "hash_size": 8, "n_probe": 2},
+    {"mode": "lsh", "label": "LSH 64t/6b/p2", "n_tables": 64, "hash_size": 6, "n_probe": 2},
     # IVF configs
     {"mode": "ivf", "label": "IVF auto/4p", "n_probe_clusters": 4},
     {"mode": "ivf", "label": "IVF auto/8p", "n_probe_clusters": 8},

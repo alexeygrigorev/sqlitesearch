@@ -203,7 +203,7 @@ Multi-probe LSH fixes this by also checking neighboring buckets. Instead of look
 
 The tradeoff is more candidates to rerank. To keep reranking fast, vectors are cached in a numpy array in memory (loaded once from SQLite on first search), so the cosine similarity computation is a single matrix-vector multiply — essentially free compared to the SQL lookup.
 
-### LSH scaling (seed=42, default: 8 tables, 16 hash bits, n_probe=0)
+### LSH scaling (seed=42, baseline: 8 tables, 16 hash bits, n_probe=0)
 
 | N vectors | Insert | vec/s | Recall@10 | Recall@100 | Avg lat | P99 lat | QPS | DB size |
 |----------:|-------:|------:|----------:|-----------:|--------:|--------:|----:|--------:|
@@ -212,7 +212,7 @@ The tradeoff is more candidates to rerank. To keep reranking fast, vectors are c
 | 100,000 | 8.90s | 11,233 | 0.29 | 0.20 | 15.6ms | — | 64 | 466 MB |
 | 1,000,000 | 123s | 8,221 | 0.31 | 0.23 | 128ms | — | 8 | 4,666 MB |
 
-With the default n_probe=0, recall is low but latency is fast. Setting n_probe=2 trades latency for much higher recall (see tuning below).
+With exact-bucket probing (`n_probe=0`), recall is low but latency is fast. The package default is `n_probe=2`, which trades latency for much higher recall (see tuning below).
 
 ### LSH tuning at 100K
 
@@ -220,7 +220,7 @@ Recall depends on three LSH parameters: `n_tables`, `hash_size`, and `n_probe`. 
 
 | n_tables | hash_size | n_probe | Recall@10 | Recall@100 | Latency | QPS |
 |---------:|----------:|--------:|----------:|-----------:|--------:|----:|
-| 8 (default) | 16 | 0 | 0.29 | 0.20 | 16ms | 64 |
+| 8 | 16 | 0 | 0.29 | 0.20 | 16ms | 64 |
 | 8 | 16 | 1 | 0.83 | 0.70 | 88ms | 11 |
 | 8 | 16 | 2 | 0.95 | 0.89 | 181ms | 6 |
 | 16 | 16 | 1 | 0.95 | 0.87 | 151ms | 7 |
@@ -228,11 +228,11 @@ Recall depends on three LSH parameters: `n_tables`, `hash_size`, and `n_probe`. 
 | 32 | 16 | 1 | 0.99 | 0.96 | 209ms | 5 |
 
 ```python
-# Default: fast, low recall
+# Default: better recall (0.89 at 100K)
 index = VectorSearchIndex(db_path="vectors.db")
 
-# Better recall (0.89 at 100K)
-index = VectorSearchIndex(n_probe=2, db_path="vectors.db")
+# Exact-bucket probing: fast, low recall
+index = VectorSearchIndex(n_probe=0, db_path="vectors.db")
 
 # Best recall (0.95 at 100K, slower inserts, larger DB)
 index = VectorSearchIndex(n_tables=16, n_probe=2, db_path="vectors.db")

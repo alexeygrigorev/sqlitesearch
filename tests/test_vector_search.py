@@ -53,6 +53,7 @@ class TestVectorSearchIndexBasics:
         assert index.keyword_fields == ["category"]
         assert index.n_tables == 8
         assert index.hash_size == 16
+        assert index.n_probe == 2
 
     def test_fit_and_search(self, sample_vectors, sample_payload, temp_db):
         """Test basic fit and search functionality."""
@@ -112,6 +113,39 @@ class TestVectorSearchIndexBasics:
         results = index.search(query, filter_dict={"category": "nonexistent"})
 
         assert len(results) == 0
+
+    def test_default_lsh_probes_neighboring_buckets(self, temp_db):
+        """Default LSH should find close vectors that miss the exact hash bucket."""
+        rng = np.random.default_rng(123)
+        base = rng.standard_normal(64).astype(np.float32)
+        base /= np.linalg.norm(base)
+
+        # The second nearby query is one hash bit away from base with seed=42.
+        rng.standard_normal(64, dtype=np.float32)
+        query = (base + 0.05 * rng.standard_normal(64, dtype=np.float32)).astype(np.float32)
+
+        exact_bucket_index = VectorSearchIndex(
+            n_tables=1,
+            hash_size=16,
+            n_probe=0,
+            seed=42,
+            db_path=temp_db,
+        )
+        exact_bucket_index.fit(np.array([base], dtype=np.float32), [{"id": 1}])
+        assert exact_bucket_index.search(query) == []
+        exact_bucket_index.close()
+        os.unlink(temp_db)
+
+        default_index = VectorSearchIndex(
+            n_tables=1,
+            hash_size=16,
+            seed=42,
+            db_path=temp_db,
+        )
+        default_index.fit(np.array([base], dtype=np.float32), [{"id": 1}])
+
+        results = default_index.search(query)
+        assert results == [{"id": 1}]
 
 
 class TestVectorSearchIndexFiltering:

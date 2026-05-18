@@ -124,7 +124,7 @@ Vector search supports three modes for approximate nearest neighbor search, all 
 
 ### LSH (default)
 
-Each vector is hashed into one bucket per table using random hyperplane projections. At query time, LSH looks up buckets matching the query's hash to find candidates, then reranks them by exact cosine similarity. With `n_probe > 0` (multi-probe), it also checks neighboring buckets that differ by 1 or 2 bits — this dramatically improves recall because similar vectors that landed in an adjacent bucket (due to one projection going the other way) are still found.
+Each vector is hashed into one bucket per table using random hyperplane projections. At query time, LSH looks up buckets matching the query's hash to find candidates, then reranks them by exact cosine similarity. By default, `n_probe=2` enables multi-probe lookup, so LSH also checks neighboring buckets that differ by 1 or 2 bits — this dramatically improves recall because similar vectors that landed in an adjacent bucket (due to one projection going the other way) are still found.
 
 ```python
 import numpy as np

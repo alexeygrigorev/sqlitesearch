@@ -18,7 +18,7 @@ class LSHStrategy:
         self,
         n_tables: int = 8,
         hash_size: int = 16,
-        n_probe: int = 0,
+        n_probe: int = 2,
         seed: Optional[int] = None,
     ):
         self.n_tables = n_tables

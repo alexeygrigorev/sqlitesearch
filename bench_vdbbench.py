@@ -12,21 +12,20 @@ Methodology follows VectorDBBench:
 3. Concurrent search: measure max QPS
 """
 
+import argparse
+import json
 import os
 import sys
 import time
-import tempfile
-import json
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 
 # Add project to path
 sys.path.insert(0, str(Path(__file__).parent))
-from sqlitesearch.vector.lsh import VectorSearchIndex
-
+from sqlitesearch.vector.index import VectorSearchIndex
 
 # --- Configuration ---
 DATASET_DIR = Path("/tmp/vectordb_bench/dataset")
@@ -41,9 +40,9 @@ SUBSET_SIZES = [10_000, 50_000, 100_000, 500_000, 1_000_000]
 
 # LSH configurations to test (recall vs speed tradeoff)
 LSH_CONFIGS = [
-    {"n_tables": 8, "hash_size": 16, "label": "default (8t/16h)"},
-    {"n_tables": 16, "hash_size": 16, "label": "high-recall (16t/16h)"},
-    {"n_tables": 32, "hash_size": 12, "label": "max-recall (32t/12h)"},
+    {"n_tables": 8, "hash_size": 16, "n_probe": 2, "label": "default (8t/16h/p2)"},
+    {"n_tables": 16, "hash_size": 16, "n_probe": 2, "label": "high-recall (16t/16h/p2)"},
+    {"n_tables": 32, "hash_size": 12, "n_probe": 2, "label": "max-recall (32t/12h/p2)"},
 ]
 
 
@@ -105,6 +104,7 @@ def run_benchmark(train_ids, train_embs, test_embs, neighbors,
     """Run a single benchmark configuration."""
     n_tables = lsh_config["n_tables"]
     hash_size = lsh_config["hash_size"]
+    n_probe = lsh_config["n_probe"]
     label = lsh_config["label"]
 
     print(f"\n{'='*70}")
@@ -129,6 +129,7 @@ def run_benchmark(train_ids, train_embs, test_embs, neighbors,
         id_field="doc_id",
         n_tables=n_tables,
         hash_size=hash_size,
+        n_probe=n_probe,
         db_path=db_path,
     )
 
@@ -197,7 +198,7 @@ def run_benchmark(train_ids, train_embs, test_embs, neighbors,
     avg_latency = np.mean(latencies) * 1000
     serial_qps = 1.0 / np.mean(latencies) if np.mean(latencies) > 0 else 0
 
-    print(f"\n  Results:")
+    print("\n  Results:")
     print(f"    Recall@{K}:     {mean_recall:.4f}")
     print(f"    Avg latency:   {avg_latency:.1f} ms")
     print(f"    P95 latency:   {p95_latency:.1f} ms")
@@ -216,6 +217,7 @@ def run_benchmark(train_ids, train_embs, test_embs, neighbors,
         "dimension": subset_embs.shape[1],
         "n_tables": n_tables,
         "hash_size": hash_size,
+        "n_probe": n_probe,
         "insert_time_s": round(t_insert, 1),
         "insert_rate_vec_s": round(n_subset / t_insert, 0),
         "db_size_mb": round(db_size_mb, 1),
@@ -267,15 +269,40 @@ def print_leaderboard_comparison(results):
         print(f"{name + suffix:<30} {best_result['serial_qps']:>8.0f} "
               f"{best_result['p99_latency_ms']:>10.1f} {best_result['recall_at_100']:>12.4f}")
 
-    print(f"\nNote: Leaderboard QPS is multi-process concurrent; sqlitesearch is serial (single-process).")
-    print(f"      Leaderboard systems run on dedicated cloud hardware (8-16 cores, 32-128GB RAM).")
-    print(f"      sqlitesearch is designed for small local projects, not 1M-scale benchmarks.")
+    print("\nNote: Leaderboard QPS is multi-process concurrent; sqlitesearch is serial (single-process).")
+    print("      Leaderboard systems run on dedicated cloud hardware (8-16 cores, 32-128GB RAM).")
+    print("      sqlitesearch is designed for small local projects, not 1M-scale benchmarks.")
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Benchmark sqlitesearch LSH against the VectorDBBench Cohere dataset"
+    )
+    parser.add_argument(
+        "--scales",
+        default=",".join(str(size) for size in SUBSET_SIZES),
+        help="Comma-separated subset sizes to benchmark",
+    )
+    parser.add_argument(
+        "--configs",
+        nargs="+",
+        default=None,
+        help="Filter LSH configs by label substring",
+    )
+    args = parser.parse_args()
+
+    subset_sizes = [int(value) for value in args.scales.split(",") if value]
+    lsh_configs = LSH_CONFIGS
+    if args.configs:
+        lsh_configs = [
+            config
+            for config in LSH_CONFIGS
+            if any(label_part in config["label"] for label_part in args.configs)
+        ]
+
     print("VectorDBBench Comparison: sqlitesearch vs Leaderboard")
     print(f"Date: {datetime.now().isoformat()}")
-    print(f"Dataset: Cohere-1M (768d, cosine)")
+    print("Dataset: Cohere-1M (768d, cosine)")
 
     # Step 1: Download dataset
     print("\n--- Downloading dataset ---")
@@ -289,12 +316,12 @@ def main():
 
     # Start with smaller subsets to show scaling behavior
     # Use a single LSH config first, then try others at a practical size
-    for n_subset in SUBSET_SIZES:
+    for n_subset in subset_sizes:
         if n_subset > len(train_embs):
             print(f"\nSkipping {n_subset:,} (only {len(train_embs):,} vectors available)")
             continue
 
-        for config in LSH_CONFIGS:
+        for config in lsh_configs:
             # For large subsets, skip expensive configs to save time
             if n_subset >= 500_000 and config["n_tables"] > 16:
                 print(f"\nSkipping {config['label']} at {n_subset:,} (too slow)")

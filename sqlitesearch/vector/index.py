@@ -43,7 +43,7 @@ class VectorSearchIndex:
         # LSH params (kept as explicit kwargs for backward compatibility)
         n_tables: int = 8,
         hash_size: int = 16,
-        n_probe: int = 0,
+        n_probe: int = 2,
         seed: Optional[int] = None,
         # IVF params
         n_clusters: Optional[int] = None,
@@ -63,6 +63,7 @@ class VectorSearchIndex:
         # Expose LSH params as attributes for backward compatibility with tests
         self.n_tables = n_tables
         self.hash_size = hash_size
+        self.n_probe = n_probe
 
         # In-memory vector cache for fast reranking
         self._dimension: Optional[int] = None

@@ -22,7 +22,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from sqlitesearch.vector.lsh import VectorSearchIndex
+from sqlitesearch.vector.index import VectorSearchIndex
 
 # --- Configuration ---
 DATASET_DIR = Path("/tmp/vectordb_bench/dataset/cohere_medium_1m")
@@ -54,7 +54,7 @@ def load_dataset():
 def run_benchmark(train_ids, train_embs, test_embs, neighbors, n_subset):
     """Run benchmark at given scale. Returns metrics + per-query result IDs."""
     print(f"\n{'='*70}")
-    print(f"Scale: {n_subset:,} vectors (8 tables, 16 hash bits, seed={SEED})")
+    print(f"Scale: {n_subset:,} vectors (8 tables, 16 hash bits, n_probe=2, seed={SEED})")
     print(f"{'='*70}")
 
     subset_embs = train_embs[:n_subset]
@@ -70,6 +70,7 @@ def run_benchmark(train_ids, train_embs, test_embs, neighbors, n_subset):
         id_field="doc_id",
         n_tables=8,
         hash_size=16,
+        n_probe=2,
         db_path=db_path,
         seed=SEED,
     )
@@ -137,6 +138,7 @@ def run_benchmark(train_ids, train_embs, test_embs, neighbors, n_subset):
         "dimension": int(subset_embs.shape[1]),
         "n_tables": 8,
         "hash_size": 16,
+        "n_probe": 2,
         "seed": SEED,
         "insert_time_s": round(t_insert, 2),
         "insert_rate_vec_s": round(n_subset / t_insert, 0),
