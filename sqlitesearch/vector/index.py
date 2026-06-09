@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from sqlitesearch.connection import connect
+
 from sqlitesearch.operators import OPERATORS, is_range_filter
 from sqlitesearch.vector.base import VectorMode
 from sqlitesearch.vector.strategy_lsh import LSHStrategy
@@ -40,6 +42,9 @@ class VectorSearchIndex:
         date_fields: Optional[list[str]] = None,
         id_field: Optional[str] = None,
         db_path: str = "sqlitesearch_vectors.db",
+        backend: str = "sqlite3",
+        sync_url: Optional[str] = None,
+        auth_token: Optional[str] = None,
         # LSH params (kept as explicit kwargs for backward compatibility)
         n_tables: int = 8,
         hash_size: int = 16,
@@ -58,6 +63,9 @@ class VectorSearchIndex:
         self.date_fields = list(date_fields) if date_fields is not None else []
         self.id_field = id_field
         self.db_path = db_path
+        self.backend = backend
+        self.sync_url = sync_url
+        self.auth_token = auth_token
         self._local = threading.local()
 
         # Expose LSH params as attributes for backward compatibility with tests
@@ -102,11 +110,12 @@ class VectorSearchIndex:
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local database connection."""
         if not hasattr(self._local, "conn"):
-            self._local.conn = sqlite3.connect(self.db_path)
-            self._local.conn.row_factory = sqlite3.Row
-            self._local.conn.execute("PRAGMA journal_mode=WAL")
-            self._local.conn.execute("PRAGMA synchronous=NORMAL")
-            self._local.conn.execute("PRAGMA cache_size=-64000")
+            self._local.conn = connect(
+                self.db_path,
+                backend=self.backend,
+                sync_url=self.sync_url,
+                auth_token=self.auth_token,
+            )
         return self._local.conn
 
     def _init_db(self) -> None:

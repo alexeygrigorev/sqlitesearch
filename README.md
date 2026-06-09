@@ -195,6 +195,28 @@ vector_results = vector_index.search(query_vector)
 
 Both index types automatically persist to disk. Reopen an existing index by creating it with the same `db_path` - it's ready to search immediately. Use `index.clear()` to remove all documents.
 
+## Turso / libSQL backend (remote persistence)
+
+By default the index is a local SQLite file opened with Python's built-in `sqlite3`. You can instead back it with [Turso](https://turso.tech) (hosted libSQL) so the data persists even on hosts with an ephemeral disk - useful for free/serverless deployments.
+
+```bash
+pip install "sqlitesearch[turso]"
+```
+
+```python
+# Embedded replica: reads/writes go through a local file that syncs to Turso.
+index = VectorSearchIndex(
+    keyword_fields=["category"],
+    db_path="local-replica.db",          # local embedded-replica cache
+    sync_url="libsql://your-db.turso.io", # Turso database URL
+    auth_token="...",                     # Turso auth token
+)
+```
+
+Reads run against the local replica (fast). The same `backend` / `sync_url` / `auth_token` parameters are available on `TextSearchIndex`.
+
+> **Note:** writing many rows *through* the embedded replica forwards each write to the remote and is slow for bulk loads. To populate a remote database, build a local file first and import it in one shot (`turso db import index.db`), then open it with `sync_url` for serving. See issue #3.
+
 ## When to Use
 
 sqlitesearch is ideal when you want:

@@ -11,6 +11,7 @@ import threading
 from datetime import date, datetime
 from typing import Any, Optional
 
+from sqlitesearch.connection import connect
 from sqlitesearch.operators import OPERATORS, is_range_filter
 from sqlitesearch.tokenizer import Tokenizer
 
@@ -51,6 +52,9 @@ class TextSearchIndex:
         db_path: str = "sqlitesearch.db",
         stemming: bool = False,
         tokenizer: Optional[Tokenizer] = None,
+        backend: str = "sqlite3",
+        sync_url: Optional[str] = None,
+        auth_token: Optional[str] = None,
     ):
         """
         Initialize the TextSearchIndex.
@@ -73,6 +77,9 @@ class TextSearchIndex:
         self.date_fields = list(date_fields) if date_fields is not None else []
         self.id_field = id_field
         self.db_path = db_path
+        self.backend = backend
+        self.sync_url = sync_url
+        self.auth_token = auth_token
         self.stemming = stemming
         self.tokenizer = tokenizer if tokenizer is not None else Tokenizer(stop_words="english")
         self._local = threading.local()
@@ -86,11 +93,12 @@ class TextSearchIndex:
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local database connection."""
         if not hasattr(self._local, "conn"):
-            self._local.conn = sqlite3.connect(self.db_path)
-            self._local.conn.row_factory = sqlite3.Row
-            self._local.conn.execute("PRAGMA journal_mode=WAL")
-            self._local.conn.execute("PRAGMA synchronous=NORMAL")
-            self._local.conn.execute("PRAGMA cache_size=-64000")
+            self._local.conn = connect(
+                self.db_path,
+                backend=self.backend,
+                sync_url=self.sync_url,
+                auth_token=self.auth_token,
+            )
         return self._local.conn
 
     def _init_db(self) -> None:

@@ -1,0 +1,164 @@
+"""Connection layer for sqlitesearch.
+
+Lets the library talk to either:
+
+* the standard library ``sqlite3`` module against a local file (default), or
+* ``libsql`` (Turso) -- a local file, or an embedded replica that syncs to a
+  remote Turso database for free persistent storage on ephemeral hosts.
+
+The rest of the codebase is written against the ``sqlite3`` API and reads
+columns by name (``row["id"]``), which relies on ``row_factory = sqlite3.Row``.
+The ``libsql`` client returns plain tuples and has no ``row_factory``, so this
+module wraps a libsql connection in thin adapters that make its rows behave
+like ``sqlite3.Row`` (named *and* positional access). That keeps every
+``row["..."]`` access in the strategies working unchanged.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from typing import Any, Optional
+
+_PRAGMAS = (
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA cache_size=-64000",
+)
+
+
+class _Row:
+    """A tuple that also supports ``row["column"]`` access, like sqlite3.Row."""
+
+    __slots__ = ("_values", "_cols")
+
+    def __init__(self, values: tuple, cols: dict[str, int]):
+        self._values = values
+        self._cols = cols
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._values[self._cols[key]]
+        return self._values[key]
+
+    def keys(self):
+        return list(self._cols.keys())
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __repr__(self):
+        return f"_Row({self._values!r})"
+
+
+class _CursorWrapper:
+    """Wraps a libsql cursor so fetch* return :class:`_Row` objects."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def _cols(self) -> dict[str, int]:
+        desc = self._cursor.description
+        return {d[0]: i for i, d in enumerate(desc)} if desc else {}
+
+    def execute(self, *args, **kwargs):
+        self._cursor.execute(*args, **kwargs)
+        return self
+
+    def executemany(self, *args, **kwargs):
+        self._cursor.executemany(*args, **kwargs)
+        return self
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        return _Row(tuple(row), self._cols())
+
+    def fetchall(self):
+        cols = self._cols()
+        return [_Row(tuple(r), cols) for r in self._cursor.fetchall()]
+
+    def __iter__(self):
+        cols = self._cols()
+        for r in self._cursor:
+            yield _Row(tuple(r), cols)
+
+    def __getattr__(self, name):
+        # lastrowid, description, rowcount, etc. fall through to the real cursor
+        return getattr(self._cursor, name)
+
+
+class _ConnectionWrapper:
+    """Wraps a libsql connection so cursors yield :class:`_Row` objects."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _CursorWrapper(self._conn.cursor())
+
+    def execute(self, *args, **kwargs):
+        return _CursorWrapper(self._conn.execute(*args, **kwargs))
+
+    def sync(self):
+        """Push local writes to / pull updates from the remote Turso replica."""
+        sync = getattr(self._conn, "sync", None)
+        if sync is not None:
+            sync()
+
+    def __getattr__(self, name):
+        # commit, rollback, close, etc. fall through to the real connection
+        return getattr(self._conn, name)
+
+
+def connect(
+    db_path: str,
+    *,
+    backend: str = "sqlite3",
+    sync_url: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Any:
+    """Open a connection for sqlitesearch.
+
+    Args:
+        db_path: Local database file path. With libsql this is the local file
+            (or local embedded-replica file when ``sync_url`` is set).
+        backend: ``"sqlite3"`` (default, stdlib) or ``"libsql"``. Providing
+            ``sync_url`` implies ``"libsql"``.
+        sync_url: Turso database URL (``libsql://...``) for an embedded
+            replica. Reads hit the local file; writes sync to Turso.
+        auth_token: Turso auth token (used with ``sync_url``).
+
+    Returns:
+        A connection object exposing the sqlite3 API with ``sqlite3.Row``-style
+        row access, regardless of backend.
+    """
+    if sync_url:
+        backend = "libsql"
+
+    if backend == "libsql":
+        import libsql
+
+        if sync_url:
+            raw = libsql.connect(db_path, sync_url=sync_url, auth_token=auth_token)
+            raw.sync()
+        else:
+            raw = libsql.connect(db_path)
+        conn: Any = _ConnectionWrapper(raw)
+    elif backend == "sqlite3":
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
+
+    for pragma in _PRAGMAS:
+        try:
+            conn.execute(pragma)
+        except Exception:
+            # Some pragmas may be unsupported / no-ops on a given backend.
+            pass
+
+    return conn

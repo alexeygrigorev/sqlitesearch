@@ -27,6 +27,12 @@ dependencies = [
     "numpy>=1.24.0",
 ]
 
+[project.optional-dependencies]
+# Back the index with Turso (hosted libSQL) instead of a local sqlite3 file.
+turso = [
+    "libsql>=0.1.0",
+]
+
 [dependency-groups]
 dev = [
     "hatch",
@@ -37,6 +43,7 @@ dev = [
     "minsearch>=0.0.10",
     "pyarrow>=23.0.1",
     "s3fs>=2026.2.0",
+    "libsql>=0.1.0",
 ]
 
 [tool.hatch.build.targets.wheel]
