@@ -77,11 +77,15 @@ def test_vector_search_libsql_matches_sqlite3(two_db_paths, mode):
     vectors = rng.standard_normal(size=(len(DOCS), 32)).astype(np.float32)
 
     def build(db_path, backend):
+        # Fix the seed so both backends get identical random projections /
+        # cluster init; otherwise the two approximate indexes can disagree on
+        # recall and the equality assertion below is flaky.
         idx = VectorSearchIndex(
             keyword_fields=["section"],
             db_path=db_path,
             mode=mode,
             backend=backend,
+            seed=42,
         )
         idx.fit(vectors, DOCS)
         return idx
