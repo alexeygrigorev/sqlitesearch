@@ -212,13 +212,12 @@ Both index types automatically persist to disk. Reopen an existing index by crea
 
 ## Storage backends
 
-By default the index is a local SQLite file opened with Python's built-in `sqlite3`. Two other backends are available via the `backend` parameter:
+By default the index is a local SQLite file opened with Python's built-in `sqlite3`. One other backend is available via the `backend` parameter:
 
 | `backend` | engine | extra | use |
 |---|---|---|---|
 | `"sqlite3"` (default) | stdlib `sqlite3` | — | local file |
 | `"libsql"` | libSQL | `sqlitesearch[libsql]` | local file, or embedded replica synced to **Turso Cloud** |
-| `"turso"` | [`pyturso`](https://github.com/tursodatabase/turso) | `sqlitesearch[turso]` | the in-process Turso engine, **fully local, no cloud** (vector search only) |
 
 ### libSQL / Turso Cloud (remote persistence)
 
@@ -238,21 +237,9 @@ index = VectorSearchIndex(
 )
 ```
 
-Reads run against the local replica (fast). The same `backend` / `sync_url` / `auth_token` parameters are available on `TextSearchIndex`. Bulk ingest is batched into multi-row inserts so it stays fast even when writes are forwarded to the remote.
+Reads run against the local replica (fast). The same `backend` / `sync_url` / `auth_token` parameters are available on `TextSearchIndex`. Bulk ingest is batched into multi-row inserts so it stays fast even when writes are forwarded to the remote. (`sqlitesearch[turso]` is accepted as an alias for `sqlitesearch[libsql]`.)
 
-### Local Turso engine (`pyturso`)
-
-For a modern, in-process engine with **no cloud dependency**, use `backend="turso"` ([`pyturso`](https://github.com/tursodatabase/turso)):
-
-```bash
-pip install "sqlitesearch[turso]"
-```
-
-```python
-index = VectorSearchIndex(keyword_fields=["category"], db_path="data.db", backend="turso")
-```
-
-> **Note:** the `pyturso` engine does not implement FTS5, so it supports `VectorSearchIndex` only. Use `sqlite3` or `libsql` for `TextSearchIndex`.
+> **Note:** an in-process `pyturso` (tursodatabase/turso) backend was evaluated and dropped — it did not scale (388s to ingest 100k vectors and ~5.8s/query, vs ~11s and ~6ms for libSQL). See [benchmark/README.md](benchmark/README.md).
 
 ## When to Use
 

@@ -29,17 +29,17 @@ _PRAGMAS = (
 # so a multi-row INSERT never exceeds the bound on any backend/version.
 _MAX_SQL_VARS = 900
 
-# For network-forwarding backends (libsql embedded replica, pyturso) each
-# statement is a round-trip, so we want the largest safe multi-row INSERT.
-# SQLite's modern limit is 32766; 30000 leaves margin. Both the libsql client
-# and pyturso accept it. For local sqlite3 the chunk size barely affects speed
-# (no network), so the conservative cap stays -- it's also safe on old SQLite.
+# For the libsql embedded replica each statement is a network round-trip, so we
+# want the largest safe multi-row INSERT. SQLite's modern limit is 32766; 30000
+# leaves margin and the libsql client accepts it. For local sqlite3 the chunk
+# size barely affects speed (no network), so the conservative cap stays -- it's
+# also safe on old SQLite.
 _MAX_SQL_VARS_NETWORK = 30000
 
 
 def max_sql_vars(backend: str) -> int:
     """Bound-variable budget per statement for a backend (see #13)."""
-    return _MAX_SQL_VARS_NETWORK if backend in ("libsql", "turso") else _MAX_SQL_VARS
+    return _MAX_SQL_VARS_NETWORK if backend == "libsql" else _MAX_SQL_VARS
 
 
 def _chunk_rows(rows: list, n_cols: int, max_vars: int = _MAX_SQL_VARS):
@@ -235,10 +235,9 @@ def connect(
     Args:
         db_path: Local database file path. With libsql this is the local file
             (or local embedded-replica file when ``sync_url`` is set).
-        backend: ``"sqlite3"`` (default, stdlib), ``"libsql"`` (local file or,
-            with ``sync_url``, a Turso Cloud embedded replica), or ``"turso"``
-            (the in-process ``pyturso`` engine -- fully local, no cloud).
-            Providing ``sync_url`` implies ``"libsql"``.
+        backend: ``"sqlite3"`` (default, stdlib) or ``"libsql"`` (local file or,
+            with ``sync_url``, a Turso Cloud embedded replica). Providing
+            ``sync_url`` implies ``"libsql"``.
         sync_url: Turso database URL (``libsql://...``) for an embedded
             replica. Reads hit the local file; writes sync to Turso.
         auth_token: Turso auth token (used with ``sync_url``).
@@ -259,14 +258,6 @@ def connect(
         else:
             raw = libsql.connect(db_path)
         conn: Any = _ConnectionWrapper(raw)
-    elif backend == "turso":
-        # pyturso: the tursodatabase/turso engine, in-process and fully local
-        # (no Turso Cloud). Returns plain tuples like libsql, so reuse the same
-        # row adapter. Note: this engine does not implement FTS5, so it backs
-        # vector search only -- TextSearchIndex raises for this backend.
-        import turso
-
-        conn = _ConnectionWrapper(turso.connect(db_path))
     elif backend == "sqlite3":
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row

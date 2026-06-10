@@ -30,13 +30,12 @@ dependencies = [
 [project.optional-dependencies]
 # Remote persistence: back the index with libSQL -- a local file, or an
 # embedded replica that syncs to Turso Cloud (set sync_url). backend="libsql".
+# `turso` is kept as an alias since Turso Cloud is the main use case.
 libsql = [
     "libsql>=0.1.0",
 ]
-# Local, in-process Turso engine (tursodatabase/turso), no cloud. backend="turso".
-# Vector search only -- this engine has no FTS5.
 turso = [
-    "pyturso>=0.1.0",
+    "libsql>=0.1.0",
 ]
 
 [dependency-groups]
@@ -50,7 +49,6 @@ dev = [
     "pyarrow>=23.0.1",
     "s3fs>=2026.2.0",
     "libsql>=0.1.0",
-    "pyturso>=0.1.0",
 ]
 
 [tool.hatch.build.targets.wheel]

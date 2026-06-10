@@ -5,13 +5,14 @@ Compares vector ingest (`fit`) time and search latency across:
 
 * ``sqlite3``        -- stdlib, local file (baseline)
 * ``libsql-local``   -- libSQL, local file (no sync)
-* ``turso-local``    -- pyturso, in-process local engine
 * ``libsql-replica`` -- libSQL embedded replica syncing to the local Turso
   emulator (``dev/turso_emulator.py``); reports the number of write
   round-trips, which is what makes naive bulk ingest slow on Turso (issue #3).
 
-Backends whose optional dependency isn't installed are skipped. Vector search
-is used because every backend supports it (pyturso has no FTS5).
+Backends whose optional dependency isn't installed are skipped.
+
+(A ``pyturso`` in-process backend was evaluated and dropped -- it did not
+scale; see benchmark/README.md.)
 
 Usage:
     uv run python benchmark/bench_backends.py
@@ -124,11 +125,6 @@ def run_size(n, dim, mode):
         rows.append(_emit(bench_local("libsql-local", n, dim, mode, backend="libsql"), n))
     except Exception:
         print("  (skipping libsql-local: libsql not installed)", flush=True)
-    try:
-        import turso  # noqa: F401
-        rows.append(_emit(bench_local("turso-local", n, dim, mode, backend="turso"), n))
-    except Exception:
-        print("  (skipping turso-local: pyturso not installed)", flush=True)
     replica = bench_replica(n, dim, mode)
     if replica:
         rows.append(_emit(replica, n))

@@ -84,12 +84,6 @@ class TextSearchIndex:
         self.date_fields = list(date_fields) if date_fields is not None else []
         self.id_field = id_field
         self.db_path = db_path
-        if backend == "turso":
-            raise ValueError(
-                "TextSearchIndex does not support the 'turso' (pyturso) backend: "
-                "that engine has no FTS5 module. Use backend='sqlite3' or "
-                "'libsql' for text search."
-            )
         self.backend = backend
         self.sync_url = sync_url
         self.auth_token = auth_token

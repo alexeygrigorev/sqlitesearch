@@ -106,21 +106,29 @@ Sweep (dim=64, LSH; machine-dependent):
 |--:|---|--:|--:|--:|
 | 1,000 | sqlite3 | 0.18 | 1.5 | – |
 | 1,000 | libsql-local | 0.20 | 2.4 | – |
-| 1,000 | turso-local (pyturso) | 0.43 | 42.7 | – |
 | 1,000 | libsql-replica | 0.32 | – | 26 |
 | 10,000 | sqlite3 | 1.16 | 1.3 | – |
 | 10,000 | libsql-local | 1.17 | 2.8 | – |
-| 10,000 | turso-local (pyturso) | 6.38 | 400.7 | – |
 | 10,000 | libsql-replica | 2.10 | – | 40 |
 | 100,000 | sqlite3 | 14.1 | 4.6 | – |
 | 100,000 | libsql-local | 10.7 | 5.9 | – |
-| 100,000 | turso-local (pyturso) | **388** | **5775** | – |
 | 100,000 | libsql-replica | 33.9 | – | **202** |
 
 Takeaways:
 - **`sqlite3` and `libsql` (local file) scale to 100k cleanly** — ~10–14 s to ingest, ~5 ms search.
 - The **libSQL embedded replica forwards every write to the remote**, so ingest cost is dominated by round-trips. Batched multi-row inserts (issues #3 / #13) keep this at **202 round-trips for 100k docs** instead of hundreds of thousands; ingest stays ~34 s.
-- **`pyturso` does not scale yet** — ingest and search grow super-linearly (388 s / 5.8 s-per-query at 100k vs 0.43 s / 43 ms at 1k). It's a fully-local engine but early-stage; fine for small data, not for 100k. Tracked in #14.
+
+### pyturso (evaluated and removed)
+
+We also evaluated an in-process [`pyturso`](https://github.com/tursodatabase/turso) (tursodatabase/turso) backend. It worked for small data but **did not scale**, so support was **removed**:
+
+| n | fit (s) | search (ms/query) |
+|--:|--:|--:|
+| 1,000 | 0.43 | 42.7 |
+| 10,000 | 6.38 | 400.7 |
+| 100,000 | **388** | **5775** |
+
+Both ingest and search grow super-linearly (vs ~11 s / ~6 ms for libSQL at 100k). The engine is early-stage; we may revisit if it matures.
 
 ## Results directory
 
