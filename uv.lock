@@ -12,7 +12,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-06-03T17:25:52.084282058Z"
+exclude-newer = "2026-06-03T17:33:39.369497041Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -2201,9 +2201,6 @@ dependencies = [
 libsql = [
     { name = "libsql" },
 ]
-turso = [
-    { name = "libsql" },
-]
 
 [package.dev-dependencies]
 dev = [
@@ -2221,10 +2218,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "libsql", marker = "extra == 'libsql'", specifier = ">=0.1.0" },
-    { name = "libsql", marker = "extra == 'turso'", specifier = ">=0.1.0" },
     { name = "numpy", specifier = ">=1.24.0" },
 ]
-provides-extras = ["libsql", "turso"]
+provides-extras = ["libsql"]
 
 [package.metadata.requires-dev]
 dev = [
