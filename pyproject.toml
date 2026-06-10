@@ -30,11 +30,7 @@ dependencies = [
 [project.optional-dependencies]
 # Remote persistence: back the index with libSQL -- a local file, or an
 # embedded replica that syncs to Turso Cloud (set sync_url). backend="libsql".
-# `turso` is kept as an alias since Turso Cloud is the main use case.
 libsql = [
-    "libsql>=0.1.0",
-]
-turso = [
     "libsql>=0.1.0",
 ]
 

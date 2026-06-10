@@ -237,9 +237,7 @@ index = VectorSearchIndex(
 )
 ```
 
-Reads run against the local replica (fast). The same `backend` / `sync_url` / `auth_token` parameters are available on `TextSearchIndex`. Bulk ingest is batched into multi-row inserts so it stays fast even when writes are forwarded to the remote. (`sqlitesearch[turso]` is accepted as an alias for `sqlitesearch[libsql]`.)
-
-> **Note:** an in-process `pyturso` (tursodatabase/turso) backend was evaluated and dropped — it did not scale (388s to ingest 100k vectors and ~5.8s/query, vs ~11s and ~6ms for libSQL). See [benchmark/README.md](benchmark/README.md).
+Reads run against the local replica (fast). The same `backend` / `sync_url` / `auth_token` parameters are available on `TextSearchIndex`. Bulk ingest is batched into multi-row inserts so it stays fast even when writes are forwarded to the remote.
 
 ## When to Use
 
