@@ -45,7 +45,7 @@ def _make_data(n, dim, seed=42):
     rng = np.random.default_rng(seed)
     vectors = rng.standard_normal((n, dim)).astype(np.float32)
     docs = [{"doc_id": i, "section": "a" if i % 2 else "b"} for i in range(n)]
-    queries = vectors[:: max(1, n // 50)][:50]
+    queries = vectors[:: max(1, n // 20)][:20]
     return vectors, docs, queries
 
 
@@ -109,41 +109,50 @@ def bench_replica(n, dim, mode):
             "round_trips": round_trips}
 
 
+def _emit(r, n):
+    """Print one result row immediately (flushed) so partial output survives."""
+    r["n"] = n
+    sm = "-" if r["search_ms"] != r["search_ms"] else f"{r['search_ms']:.3f}"  # nan check
+    print(f"{n:>9,}  {r['backend']:<16}{r['fit_s']:>10.3f}{sm:>14}{str(r['round_trips']):>12}", flush=True)
+    return r
+
+
+def run_size(n, dim, mode):
+    rows = [_emit(bench_local("sqlite3", n, dim, mode, backend="sqlite3"), n)]
+    try:
+        import libsql  # noqa: F401
+        rows.append(_emit(bench_local("libsql-local", n, dim, mode, backend="libsql"), n))
+    except Exception:
+        print("  (skipping libsql-local: libsql not installed)", flush=True)
+    try:
+        import turso  # noqa: F401
+        rows.append(_emit(bench_local("turso-local", n, dim, mode, backend="turso"), n))
+    except Exception:
+        print("  (skipping turso-local: pyturso not installed)", flush=True)
+    replica = bench_replica(n, dim, mode)
+    if replica:
+        rows.append(_emit(replica, n))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=2000, help="number of documents")
+    ap.add_argument("--n", type=int, nargs="+", default=[2000],
+                    help="document counts to sweep, e.g. --n 1000 10000 100000")
     ap.add_argument("--dim", type=int, default=64, help="vector dimension")
     ap.add_argument("--mode", default="lsh", choices=["lsh", "ivf", "hnsw"])
     args = ap.parse_args()
 
-    print(f"Backends benchmark: n={args.n} dim={args.dim} mode={args.mode}\n")
-    rows = [bench_local("sqlite3", args.n, args.dim, args.mode, backend="sqlite3")]
-
-    try:
-        import libsql  # noqa: F401
-        rows.append(bench_local("libsql-local", args.n, args.dim, args.mode, backend="libsql"))
-    except Exception:
-        print("  (skipping libsql-local: libsql not installed)")
-
-    try:
-        import turso  # noqa: F401
-        rows.append(bench_local("turso-local", args.n, args.dim, args.mode, backend="turso"))
-    except Exception:
-        print("  (skipping turso-local: pyturso not installed)")
-
-    replica = bench_replica(args.n, args.dim, args.mode)
-    if replica:
-        rows.append(replica)
-
-    print(f"\n{'backend':<16}{'fit (s)':>10}{'search (ms)':>14}{'write RTs':>12}")
-    print("-" * 52)
-    for r in rows:
-        sm = "-" if r["search_ms"] != r["search_ms"] else f"{r['search_ms']:.3f}"  # nan check
-        print(f"{r['backend']:<16}{r['fit_s']:>10.3f}{sm:>14}{str(r['round_trips']):>12}")
+    print(f"Backends benchmark: sizes={args.n} dim={args.dim} mode={args.mode}\n", flush=True)
+    print(f"{'n':>9}  {'backend':<16}{'fit (s)':>10}{'search (ms)':>14}{'write RTs':>12}", flush=True)
+    print("-" * 62, flush=True)
+    for n in args.n:
+        run_size(n, args.dim, args.mode)
     print(
         "\nNote: libsql-replica forwards each write to the remote; 'write RTs' is\n"
-        "the number of round-trips for fit(). Batched multi-row inserts (issue #3)\n"
-        "keep it ~O(n/chunk) instead of O(n)."
+        "the number of round-trips for fit(). Batched multi-row inserts (issues\n"
+        "#3 / #13) keep it ~O(n/chunk) instead of O(n).",
+        flush=True,
     )
 
 
