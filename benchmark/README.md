@@ -92,6 +92,27 @@ uv run python benchmark/run_benchmark.py -n 10000 -q 100
 uv run python benchmark/run_full_benchmark.py
 ```
 
+## Storage backends
+
+`bench_backends.py` compares vector ingest (`fit`) time and search latency across the storage backends, and reports the number of write round-trips for a libSQL embedded replica (driven by the local Turso emulator in `dev/turso_emulator.py`, so no Turso account is needed).
+
+```bash
+uv run python benchmark/bench_backends.py --n 2000 --dim 64 --mode lsh
+```
+
+Representative run (n=2000, dim=64, LSH; numbers are machine-dependent):
+
+| backend | fit (s) | search (ms) | write round-trips |
+|---|--:|--:|--:|
+| `sqlite3` (local) | 0.27 | 1.6 | – |
+| `libsql-local` | 0.28 | 3.5 | – |
+| `turso-local` (pyturso) | 0.49 | ~108 | – |
+| `libsql-replica` (→ emulator) | 0.82 | – | **144** |
+
+Takeaways:
+- The **libSQL embedded replica forwards every write to the remote**, so ingest cost is dominated by round-trips. Batched multi-row inserts (issue #3) keep this at ~144 for 2000 docs instead of thousands (per-row would be one round-trip per doc plus one per index row).
+- `pyturso` vector search is currently much slower than `sqlite3`/`libsql` — that engine is early-stage; it's a fully-local option but not yet a speed win for reads.
+
 ## Results directory
 
 `results/` contains raw JSON output from earlier text search and LSH optimization runs, kept for reference.
