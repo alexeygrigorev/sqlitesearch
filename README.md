@@ -210,27 +210,49 @@ vector_results = vector_index.search(query_vector, output_ids=True)
 
 Both index types automatically persist to disk. Reopen an existing index by creating it with the same `db_path` - it's ready to search immediately. Use `index.clear()` to remove all documents.
 
-## Turso / libSQL backend (remote persistence)
+## Storage backends
 
-By default the index is a local SQLite file opened with Python's built-in `sqlite3`. You can instead back it with [Turso](https://turso.tech) (hosted libSQL) so the data persists even on hosts with an ephemeral disk - useful for free/serverless deployments.
+By default the index is a local SQLite file opened with Python's built-in `sqlite3`. Two other backends are available via the `backend` parameter:
+
+| `backend` | engine | extra | use |
+|---|---|---|---|
+| `"sqlite3"` (default) | stdlib `sqlite3` | — | local file |
+| `"libsql"` | libSQL | `sqlitesearch[libsql]` | local file, or embedded replica synced to **Turso Cloud** |
+| `"turso"` | [`pyturso`](https://github.com/tursodatabase/turso) | `sqlitesearch[turso]` | the in-process Turso engine, **fully local, no cloud** (vector search only) |
+
+### libSQL / Turso Cloud (remote persistence)
+
+Back the index with [libSQL](https://github.com/tursodatabase/libsql) so the data persists even on hosts with an ephemeral disk — useful for free/serverless deployments.
+
+```bash
+pip install "sqlitesearch[libsql]"
+```
+
+```python
+# Embedded replica: reads run against a local file that syncs to Turso Cloud.
+index = VectorSearchIndex(
+    keyword_fields=["category"],
+    db_path="local-replica.db",           # local embedded-replica cache
+    sync_url="libsql://your-db.turso.io",  # Turso database URL
+    auth_token="...",                      # Turso auth token
+)
+```
+
+Reads run against the local replica (fast). The same `backend` / `sync_url` / `auth_token` parameters are available on `TextSearchIndex`. Bulk ingest is batched into multi-row inserts so it stays fast even when writes are forwarded to the remote.
+
+### Local Turso engine (`pyturso`)
+
+For a modern, in-process engine with **no cloud dependency**, use `backend="turso"` ([`pyturso`](https://github.com/tursodatabase/turso)):
 
 ```bash
 pip install "sqlitesearch[turso]"
 ```
 
 ```python
-# Embedded replica: reads/writes go through a local file that syncs to Turso.
-index = VectorSearchIndex(
-    keyword_fields=["category"],
-    db_path="local-replica.db",          # local embedded-replica cache
-    sync_url="libsql://your-db.turso.io", # Turso database URL
-    auth_token="...",                     # Turso auth token
-)
+index = VectorSearchIndex(keyword_fields=["category"], db_path="data.db", backend="turso")
 ```
 
-Reads run against the local replica (fast). The same `backend` / `sync_url` / `auth_token` parameters are available on `TextSearchIndex`.
-
-> **Note:** writing many rows *through* the embedded replica forwards each write to the remote and is slow for bulk loads. To populate a remote database, build a local file first and import it in one shot (`turso db import index.db`), then open it with `sync_url` for serving. See issue #3.
+> **Note:** the `pyturso` engine does not implement FTS5, so it supports `VectorSearchIndex` only. Use `sqlite3` or `libsql` for `TextSearchIndex`.
 
 ## When to Use
 
