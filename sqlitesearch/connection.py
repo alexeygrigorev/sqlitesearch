@@ -222,8 +222,10 @@ def connect(
     Args:
         db_path: Local database file path. With libsql this is the local file
             (or local embedded-replica file when ``sync_url`` is set).
-        backend: ``"sqlite3"`` (default, stdlib) or ``"libsql"``. Providing
-            ``sync_url`` implies ``"libsql"``.
+        backend: ``"sqlite3"`` (default, stdlib), ``"libsql"`` (local file or,
+            with ``sync_url``, a Turso Cloud embedded replica), or ``"turso"``
+            (the in-process ``pyturso`` engine -- fully local, no cloud).
+            Providing ``sync_url`` implies ``"libsql"``.
         sync_url: Turso database URL (``libsql://...``) for an embedded
             replica. Reads hit the local file; writes sync to Turso.
         auth_token: Turso auth token (used with ``sync_url``).
@@ -244,6 +246,14 @@ def connect(
         else:
             raw = libsql.connect(db_path)
         conn: Any = _ConnectionWrapper(raw)
+    elif backend == "turso":
+        # pyturso: the tursodatabase/turso engine, in-process and fully local
+        # (no Turso Cloud). Returns plain tuples like libsql, so reuse the same
+        # row adapter. Note: this engine does not implement FTS5, so it backs
+        # vector search only -- TextSearchIndex raises for this backend.
+        import turso
+
+        conn = _ConnectionWrapper(turso.connect(db_path))
     elif backend == "sqlite3":
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
