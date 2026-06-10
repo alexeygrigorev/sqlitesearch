@@ -11,7 +11,7 @@ import threading
 from datetime import date, datetime
 from typing import Any, Optional
 
-from sqlitesearch.connection import connect
+from sqlitesearch.connection import bulk_insert, bulk_insert_returning_ids, connect
 from sqlitesearch.operators import OPERATORS, is_range_filter
 from sqlitesearch.tokenizer import Tokenizer
 
@@ -225,11 +225,7 @@ class TextSearchIndex:
             + [f'"{field}"' for field in self.date_fields]
         )
         all_cols = ["doc_json"] + filter_cols
-        col_names = ", ".join(all_cols)
-        placeholders = ", ".join(["?"] * len(all_cols))
-
-        fts_col_names = ", ".join(["docid"] + [f'"{field}"' for field in self.text_fields])
-        fts_placeholders = ", ".join(["?"] * (1 + len(self.text_fields)))
+        fts_cols = ["docid"] + [f'"{field}"' for field in self.text_fields]
 
         # Prepare all rows
         doc_rows = []
@@ -259,22 +255,14 @@ class TextSearchIndex:
             doc_rows.append([doc_json] + keyword_vals + numeric_vals + date_vals)
             fts_text_per_doc.append([str(doc.get(field, "")) for field in self.text_fields])
 
-        # Batch insert into docs table
-        doc_insert_sql = f"INSERT INTO docs ({col_names}) VALUES ({placeholders})"
-        cursor.executemany(doc_insert_sql, doc_rows)
+        # Batch insert into docs table. bulk_insert collapses each chunk of
+        # rows into one multi-row INSERT, which matters for the libsql/Turso
+        # backend where every statement is a network round-trip (issue #3).
+        doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows)
 
-        # Get the range of inserted IDs (AUTOINCREMENT guarantees sequential)
-        cursor.execute("SELECT MAX(id) FROM docs")
-        last_id = cursor.fetchone()[0]
-        first_id = last_id - len(docs) + 1
-
-        # Batch insert into FTS5 table
-        fts_rows = []
-        for i, fts_text in enumerate(fts_text_per_doc):
-            fts_rows.append([first_id + i] + fts_text)
-
-        fts_insert_sql = f"INSERT INTO docs_fts ({fts_col_names}) VALUES ({fts_placeholders})"
-        cursor.executemany(fts_insert_sql, fts_rows)
+        # Batch insert into FTS5 table, keyed by the ids just assigned.
+        fts_rows = [[doc_ids[i]] + fts_text for i, fts_text in enumerate(fts_text_per_doc)]
+        bulk_insert(cursor, "docs_fts", fts_cols, fts_rows)
 
         conn.commit()
         return self

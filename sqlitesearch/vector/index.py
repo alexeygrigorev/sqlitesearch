@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from sqlitesearch.connection import connect
+from sqlitesearch.connection import bulk_insert_returning_ids, connect
 
 from sqlitesearch.operators import OPERATORS, is_range_filter
 from sqlitesearch.vector.base import VectorMode
@@ -241,8 +241,6 @@ class VectorSearchIndex:
             + [f'"{field}"' for field in self.date_fields]
         )
         all_cols = ["doc_json", "vector_hash"] + filter_cols
-        col_names = ", ".join(all_cols)
-        placeholders = ", ".join(["?"] * len(all_cols))
 
         # Prepare doc rows
         doc_rows = []
@@ -268,12 +266,11 @@ class VectorSearchIndex:
 
             doc_rows.append([doc_json, vector_bytes] + keyword_vals + numeric_vals + date_vals)
 
-        # Insert docs and collect IDs
-        insert_sql = f"INSERT INTO docs ({col_names}) VALUES ({placeholders})"
-        doc_ids = []
-        for row in doc_rows:
-            cursor.execute(insert_sql, row)
-            doc_ids.append(cursor.lastrowid)
+        # Insert docs and collect IDs. bulk_insert_returning_ids collapses the
+        # inserts into chunked multi-row statements, which matters for the
+        # libsql/Turso backend where each statement is a network round-trip
+        # (issue #3) -- the old per-row loop was one round-trip per document.
+        doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows)
 
         # Build strategy index
         if is_fit:
