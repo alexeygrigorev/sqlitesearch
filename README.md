@@ -239,6 +239,31 @@ index = VectorSearchIndex(
 
 Reads run against the local replica (fast). The same `backend` / `sync_url` / `auth_token` parameters are available on `TextSearchIndex`. Bulk ingest is batched into multi-row inserts so it stays fast even when writes are forwarded to the remote.
 
+#### Deploy pattern: ingest once, serve read-only
+
+For a free or serverless host with an ephemeral disk, split the work in two so the running app never rebuilds the index:
+
+1. **Ingest (offline, once)** — build the index and write it straight to Turso. Batched `fit()` keeps this fast even over the network.
+2. **Serve (every request)** — open the same index with `sync_url` set. On boot the embedded replica syncs the data down once; every search then reads the local file with no per-query round-trip.
+
+```python
+# ingest.py — run once, writes to Turso
+index = VectorSearchIndex(keyword_fields=["category"], db_path="cache.db",
+                          sync_url=URL, auth_token=TOKEN)
+index.fit(vectors, docs)
+
+# app.py — the running service, read-only
+index = VectorSearchIndex(keyword_fields=["category"], db_path="cache.db",
+                          sync_url=URL, auth_token=TOKEN)
+results = index.search(query_vector)
+```
+
+Prefer to build the index offline (in CI, say) and ship a finished file? Build a plain local `.db`, then seed Turso from it in one shot:
+
+```bash
+turso db create my-index --from-file local.db
+```
+
 ## When to Use
 
 sqlitesearch is ideal when you want:
