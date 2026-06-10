@@ -51,10 +51,26 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v5
         with:
           name: dist
           path: dist
+      - name: Build release notes from the commit log
+        # Plain commit-log notes -- deliberately NOT --generate-notes, which
+        # adds "by @user" attributions and a "New Contributors" section.
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          RANGE="${TAG}"
+          [ -n "$PREV" ] && RANGE="${PREV}..${TAG}"
+          {
+            git log --no-merges --pretty='- %s' "$RANGE" \
+              | grep -viE '^- (Bump version|Sync uv\.lock)' || true
+          } > NOTES.md
+          [ -s NOTES.md ] || echo "- ${TAG}" > NOTES.md
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -62,5 +78,5 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
-            --generate-notes \
+            --notes-file NOTES.md \
             dist/*
