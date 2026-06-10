@@ -6,6 +6,11 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Opt JS actions into Node 24 (silences the Node 20 deprecation warning for
+# actions that don't yet ship a Node 24 release, e.g. setup-uv / upload-artifact).
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -38,3 +43,24 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
+
+  github-release:
+    needs: [build, publish-pypi]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*
