@@ -11,7 +11,7 @@ from typing import Optional
 
 import numpy as np
 
-from sqlitesearch.connection import bulk_insert
+from sqlitesearch.connection import _MAX_SQL_VARS, bulk_insert
 
 
 class IVFStrategy:
@@ -95,15 +95,16 @@ class IVFStrategy:
         self._centroids = self._kmeans(normed, self.n_clusters)
 
         # Store centroids in DB
+        mv = getattr(self, "_max_vars", _MAX_SQL_VARS)
         centroid_rows = [
             (cid, self._centroids[cid].tobytes()) for cid in range(len(self._centroids))
         ]
-        bulk_insert(cursor, "ivf_centroids", ["cluster_id", "centroid"], centroid_rows)
+        bulk_insert(cursor, "ivf_centroids", ["cluster_id", "centroid"], centroid_rows, max_vars=mv)
 
         # Assign vectors to nearest centroid
         assignments = self._assign(normed)  # (n,) array of cluster IDs
         rows = [(int(doc_ids[i]), int(assignments[i])) for i in range(n)]
-        bulk_insert(cursor, "ivf_assignments", ["doc_id", "cluster_id"], rows)
+        bulk_insert(cursor, "ivf_assignments", ["doc_id", "cluster_id"], rows, max_vars=mv)
 
         # Save params
         self.save_params(cursor)
@@ -118,7 +119,10 @@ class IVFStrategy:
         normed = self._normalize(vectors)
         assignments = self._assign(normed)
         rows = [(int(doc_ids[i]), int(assignments[i])) for i in range(len(vectors))]
-        bulk_insert(cursor, "ivf_assignments", ["doc_id", "cluster_id"], rows)
+        bulk_insert(
+            cursor, "ivf_assignments", ["doc_id", "cluster_id"], rows,
+            max_vars=getattr(self, "_max_vars", _MAX_SQL_VARS),
+        )
 
     def find_candidates(self, cursor: sqlite3.Cursor, query_vector: np.ndarray) -> set[int]:
         """Find candidates by probing nearest clusters."""

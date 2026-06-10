@@ -29,35 +29,48 @@ _PRAGMAS = (
 # so a multi-row INSERT never exceeds the bound on any backend/version.
 _MAX_SQL_VARS = 900
 
+# For network-forwarding backends (libsql embedded replica, pyturso) each
+# statement is a round-trip, so we want the largest safe multi-row INSERT.
+# SQLite's modern limit is 32766; 30000 leaves margin. Both the libsql client
+# and pyturso accept it. For local sqlite3 the chunk size barely affects speed
+# (no network), so the conservative cap stays -- it's also safe on old SQLite.
+_MAX_SQL_VARS_NETWORK = 30000
 
-def _chunk_rows(rows: list, n_cols: int):
-    max_rows = max(1, _MAX_SQL_VARS // max(1, n_cols))
+
+def max_sql_vars(backend: str) -> int:
+    """Bound-variable budget per statement for a backend (see #13)."""
+    return _MAX_SQL_VARS_NETWORK if backend in ("libsql", "turso") else _MAX_SQL_VARS
+
+
+def _chunk_rows(rows: list, n_cols: int, max_vars: int = _MAX_SQL_VARS):
+    max_rows = max(1, max_vars // max(1, n_cols))
     for i in range(0, len(rows), max_rows):
         yield rows[i : i + max_rows]
 
 
-def bulk_insert(cursor, table: str, columns: list, rows: list) -> None:
+def bulk_insert(cursor, table: str, columns: list, rows: list, max_vars: int = _MAX_SQL_VARS) -> None:
     """Insert ``rows`` using chunked multi-row ``INSERT`` statements.
 
     Equivalent to ``cursor.executemany`` but collapses each chunk of rows into a
     single statement. Over the libsql/Turso embedded-replica backend, every
     statement is a network round-trip to the remote primary, so an N-row
     ``executemany`` becomes N round-trips. Batching turns that into ~N/chunk
-    round-trips (see issue #3). ``columns`` are pre-formatted column tokens;
-    ``rows`` is a list of equal-length value sequences.
+    round-trips (see issue #3); ``max_vars`` controls the chunk size. ``columns``
+    are pre-formatted column tokens; ``rows`` is a list of equal-length value
+    sequences.
     """
     if not rows:
         return
     n_cols = len(columns)
     col_sql = ", ".join(columns)
     row_ph = "(" + ", ".join(["?"] * n_cols) + ")"
-    for chunk in _chunk_rows(rows, n_cols):
+    for chunk in _chunk_rows(rows, n_cols, max_vars):
         values_sql = ", ".join([row_ph] * len(chunk))
         flat = [v for row in chunk for v in row]
         cursor.execute(f"INSERT INTO {table} ({col_sql}) VALUES {values_sql}", flat)
 
 
-def bulk_insert_returning_ids(cursor, table: str, columns: list, rows: list) -> list:
+def bulk_insert_returning_ids(cursor, table: str, columns: list, rows: list, max_vars: int = _MAX_SQL_VARS) -> list:
     """Like :func:`bulk_insert`, returning the autoincrement ids of the inserted
     rows in order.
 
@@ -71,7 +84,7 @@ def bulk_insert_returning_ids(cursor, table: str, columns: list, rows: list) -> 
     n_cols = len(columns)
     col_sql = ", ".join(columns)
     row_ph = "(" + ", ".join(["?"] * n_cols) + ")"
-    for chunk in _chunk_rows(rows, n_cols):
+    for chunk in _chunk_rows(rows, n_cols, max_vars):
         values_sql = ", ".join([row_ph] * len(chunk))
         flat = [v for row in chunk for v in row]
         cursor.execute(f"INSERT INTO {table} ({col_sql}) VALUES {values_sql}", flat)
@@ -80,7 +93,7 @@ def bulk_insert_returning_ids(cursor, table: str, columns: list, rows: list) -> 
     return ids
 
 
-def bulk_upsert(cursor, table: str, columns: list, rows: list, conflict_col: str, update_cols: list) -> None:
+def bulk_upsert(cursor, table: str, columns: list, rows: list, conflict_col: str, update_cols: list, max_vars: int = _MAX_SQL_VARS) -> None:
     """Chunked multi-row ``INSERT ... ON CONFLICT(conflict_col) DO UPDATE``.
 
     Used for shared/hybrid files (issue #2): documents are keyed by the user's
@@ -94,7 +107,7 @@ def bulk_upsert(cursor, table: str, columns: list, rows: list, conflict_col: str
     col_sql = ", ".join(columns)
     row_ph = "(" + ", ".join(["?"] * n_cols) + ")"
     set_sql = ", ".join(f"{c}=excluded.{c}" for c in update_cols)
-    for chunk in _chunk_rows(rows, n_cols):
+    for chunk in _chunk_rows(rows, n_cols, max_vars):
         values_sql = ", ".join([row_ph] * len(chunk))
         flat = [v for row in chunk for v in row]
         cursor.execute(
@@ -104,7 +117,7 @@ def bulk_upsert(cursor, table: str, columns: list, rows: list, conflict_col: str
         )
 
 
-def fetch_ids_by_key(cursor, table: str, id_col: str, key_values: list) -> dict:
+def fetch_ids_by_key(cursor, table: str, id_col: str, key_values: list, max_vars: int = _MAX_SQL_VARS) -> dict:
     """Return ``{str(key_value): internal_id}`` for the given key column values.
 
     Keys are normalised to ``str`` because the id column has TEXT affinity, so
@@ -113,8 +126,8 @@ def fetch_ids_by_key(cursor, table: str, id_col: str, key_values: list) -> dict:
     """
     out: dict = {}
     keys = list(key_values)
-    for i in range(0, len(keys), _MAX_SQL_VARS):
-        chunk = keys[i : i + _MAX_SQL_VARS]
+    for i in range(0, len(keys), max_vars):
+        chunk = keys[i : i + max_vars]
         ph = ",".join(["?"] * len(chunk))
         cursor.execute(f"SELECT id, {id_col} FROM {table} WHERE {id_col} IN ({ph})", chunk)
         for row in cursor.fetchall():

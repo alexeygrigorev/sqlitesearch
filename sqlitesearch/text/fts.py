@@ -17,6 +17,7 @@ from sqlitesearch.connection import (
     bulk_upsert,
     connect,
     fetch_ids_by_key,
+    max_sql_vars,
 )
 from sqlitesearch.operators import OPERATORS, is_range_filter
 from sqlitesearch.tokenizer import Tokenizer
@@ -92,6 +93,7 @@ class TextSearchIndex:
         self.backend = backend
         self.sync_url = sync_url
         self.auth_token = auth_token
+        self._max_vars = max_sql_vars(backend)
         self.stemming = stemming
         self.tokenizer = tokenizer if tokenizer is not None else Tokenizer(stop_words="english")
         self._local = threading.local()
@@ -295,21 +297,21 @@ class TextSearchIndex:
             # rows a VectorSearchIndex may already have written (and don't
             # duplicate on re-fit). Don't touch vector_hash.
             id_col = f'"{self.id_field}"'
-            bulk_upsert(cursor, "docs", all_cols, doc_rows, id_col, all_cols)
+            bulk_upsert(cursor, "docs", all_cols, doc_rows, id_col, all_cols, max_vars=self._max_vars)
             key_vals = [doc.get(self.id_field) for doc in docs]
-            id_map = fetch_ids_by_key(cursor, "docs", id_col, key_vals)
+            id_map = fetch_ids_by_key(cursor, "docs", id_col, key_vals, max_vars=self._max_vars)
             doc_ids = [id_map[str(v)] for v in key_vals]
             # Drop any stale FTS rows for these ids so a re-fit doesn't duplicate.
-            for i in range(0, len(doc_ids), 900):
-                chunk = doc_ids[i : i + 900]
+            for i in range(0, len(doc_ids), self._max_vars):
+                chunk = doc_ids[i : i + self._max_vars]
                 ph = ",".join(["?"] * len(chunk))
                 cursor.execute(f"DELETE FROM docs_fts WHERE docid IN ({ph})", chunk)
         else:
-            doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows)
+            doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows, max_vars=self._max_vars)
 
         # Batch insert into FTS5 table, keyed by the ids just assigned.
         fts_rows = [[doc_ids[i]] + fts_text for i, fts_text in enumerate(fts_text_per_doc)]
-        bulk_insert(cursor, "docs_fts", fts_cols, fts_rows)
+        bulk_insert(cursor, "docs_fts", fts_cols, fts_rows, max_vars=self._max_vars)
 
         conn.commit()
         return self
