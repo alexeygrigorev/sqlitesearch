@@ -100,28 +100,26 @@ uv run python benchmark/run_full_benchmark.py
 uv run python benchmark/bench_backends.py --n 1000 10000 100000 --dim 64 --mode lsh
 ```
 
-Sweep (dim=64, LSH; machine-dependent):
-
 Sweep (dim=64, LSH; machine-dependent). `turso-local` (pyturso) is included to show why it was **evaluated and removed** — it does not scale:
 
 | n | backend | fit (s) | search (ms) | write round-trips |
 |--:|---|--:|--:|--:|
-| 1,000 | sqlite3 | 0.18 | 1.5 | – |
-| 1,000 | libsql-local | 0.20 | 2.4 | – |
+| 1,000 | sqlite3 | 0.19 | 1.5 | – |
+| 1,000 | libsql-local | 0.17 | 2.2 | – |
 | 1,000 | turso-local (pyturso) | 0.43 | 42.7 | – |
-| 1,000 | libsql-replica | 0.32 | – | 26 |
-| 10,000 | sqlite3 | 1.16 | 1.3 | – |
-| 10,000 | libsql-local | 1.17 | 2.8 | – |
+| 1,000 | libsql-replica | 0.36 | – | 26 |
+| 10,000 | sqlite3 | 1.53 | 2.3 | – |
+| 10,000 | libsql-local | 1.24 | 2.5 | – |
 | 10,000 | turso-local (pyturso) | 6.38 | 400.7 | – |
-| 10,000 | libsql-replica | 2.10 | – | 40 |
-| 100,000 | sqlite3 | 14.1 | 4.6 | – |
-| 100,000 | libsql-local | 10.7 | 5.9 | – |
+| 10,000 | libsql-replica | 2.21 | – | 40 |
+| 100,000 | sqlite3 | 16.0 | 5.9 | – |
+| 100,000 | libsql-local | 12.4 | 8.8 | – |
 | 100,000 | turso-local (pyturso) | **388** | **5775** | – |
-| 100,000 | libsql-replica | 33.9 | – | **202** |
+| 100,000 | libsql-replica | 30.3 | – | **202** |
 
 Takeaways:
-- **`sqlite3` and `libsql` (local file) scale to 100k cleanly** — ~10–14 s to ingest, ~5 ms search.
-- The **libSQL embedded replica forwards every write to the remote**, so ingest cost is dominated by round-trips. Batched multi-row inserts (issues #3 / #13) keep this at **202 round-trips for 100k docs** instead of hundreds of thousands; ingest stays ~34 s.
+- **`sqlite3` and `libsql` (local file) scale to 100k cleanly** — ~12–16 s to ingest, ~6–9 ms search.
+- The **libSQL embedded replica forwards every write to the remote**, so ingest cost is dominated by round-trips. Batched multi-row inserts (issues #3 / #13) keep this at **202 round-trips for 100k docs** instead of hundreds of thousands; ingest stays ~30 s (local emulator).
 - **`pyturso` does not scale** — ingest and search grow super-linearly (388 s / 5.8 s-per-query at 100k vs 0.43 s / 43 ms at 1k, and ~11 s / ~6 ms for libSQL). The engine is early-stage, so the `turso` (pyturso) backend was **removed**; we may revisit if it matures. The numbers above are kept as the evidence.
 
 ### Verified on actual Turso Cloud
