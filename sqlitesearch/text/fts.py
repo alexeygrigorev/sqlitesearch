@@ -11,7 +11,13 @@ import threading
 from datetime import date, datetime
 from typing import Any, Optional
 
-from sqlitesearch.connection import bulk_insert, bulk_insert_returning_ids, connect
+from sqlitesearch.connection import (
+    bulk_insert,
+    bulk_insert_returning_ids,
+    bulk_upsert,
+    connect,
+    fetch_ids_by_key,
+)
 from sqlitesearch.operators import OPERATORS, is_range_filter
 from sqlitesearch.tokenizer import Tokenizer
 
@@ -124,11 +130,15 @@ class TextSearchIndex:
             date_cols.append(f', "{field}" TEXT')
         date_sql = "\n".join(date_cols)
 
-        # Create main documents table
+        # Create main documents table. The nullable vector_hash column is part
+        # of the shared schema so that a TextSearchIndex and a VectorSearchIndex
+        # can use the same `docs` table in one file (hybrid search, issue #2);
+        # the text index just leaves it NULL.
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS docs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doc_json TEXT NOT NULL{keyword_sql}{numeric_sql}{date_sql}
+                doc_json TEXT NOT NULL,
+                vector_hash BLOB{keyword_sql}{numeric_sql}{date_sql}
             )
         """)
 
@@ -161,6 +171,13 @@ class TextSearchIndex:
         for field in self.date_fields:
             cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_date_{field} ON docs ("{field}")')
 
+        # Unique index on the user id field enables upsert-by-id so a shared
+        # docs table is deduplicated across the text and vector index (#2).
+        if self.id_field and self.id_field != "id":
+            cursor.execute(
+                f'CREATE UNIQUE INDEX IF NOT EXISTS uidx_docs_id ON docs ("{self.id_field}")'
+            )
+
         conn.commit()
 
     def count(self) -> int:
@@ -172,8 +189,17 @@ class TextSearchIndex:
         return row["count"]
 
     def _is_empty(self) -> bool:
-        """Check if the index is empty."""
-        return self.count() == 0
+        """Check whether this index has any *text* entries.
+
+        Checks the FTS table rather than ``docs`` so that a TextSearchIndex can
+        be fitted into a file whose ``docs`` table was already populated by a
+        VectorSearchIndex (shared/hybrid file, issue #2) without tripping the
+        "already contains documents" guard.
+        """
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as count FROM docs_fts")
+        return cursor.fetchone()["count"] == 0
 
     def fit(self, docs: list[dict[str, Any]]) -> "TextSearchIndex":
         """
@@ -255,10 +281,25 @@ class TextSearchIndex:
             doc_rows.append([doc_json] + keyword_vals + numeric_vals + date_vals)
             fts_text_per_doc.append([str(doc.get(field, "")) for field in self.text_fields])
 
-        # Batch insert into docs table. bulk_insert collapses each chunk of
-        # rows into one multi-row INSERT, which matters for the libsql/Turso
-        # backend where every statement is a network round-trip (issue #3).
-        doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows)
+        # Insert into the docs table. bulk_insert collapses each chunk of rows
+        # into one multi-row INSERT, which matters for the libsql/Turso backend
+        # where every statement is a network round-trip (issue #3).
+        if self.id_field and self.id_field != "id":
+            # Shared/hybrid file (#2): upsert by the user id so we reuse the
+            # rows a VectorSearchIndex may already have written (and don't
+            # duplicate on re-fit). Don't touch vector_hash.
+            id_col = f'"{self.id_field}"'
+            bulk_upsert(cursor, "docs", all_cols, doc_rows, id_col, all_cols)
+            key_vals = [doc.get(self.id_field) for doc in docs]
+            id_map = fetch_ids_by_key(cursor, "docs", id_col, key_vals)
+            doc_ids = [id_map[str(v)] for v in key_vals]
+            # Drop any stale FTS rows for these ids so a re-fit doesn't duplicate.
+            for i in range(0, len(doc_ids), 900):
+                chunk = doc_ids[i : i + 900]
+                ph = ",".join(["?"] * len(chunk))
+                cursor.execute(f"DELETE FROM docs_fts WHERE docid IN ({ph})", chunk)
+        else:
+            doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows)
 
         # Batch insert into FTS5 table, keyed by the ids just assigned.
         fts_rows = [[doc_ids[i]] + fts_text for i, fts_text in enumerate(fts_text_per_doc)]

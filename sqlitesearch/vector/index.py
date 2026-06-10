@@ -14,7 +14,12 @@ from typing import Any, Optional
 
 import numpy as np
 
-from sqlitesearch.connection import bulk_insert_returning_ids, connect
+from sqlitesearch.connection import (
+    bulk_insert_returning_ids,
+    bulk_upsert,
+    connect,
+    fetch_ids_by_key,
+)
 
 from sqlitesearch.operators import OPERATORS, is_range_filter
 from sqlitesearch.vector.base import VectorMode
@@ -154,6 +159,13 @@ class VectorSearchIndex:
         for field in self.date_fields:
             cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_vec_date_{field} ON docs ("{field}")')
 
+        # Unique index on the user id field enables upsert-by-id so a shared
+        # docs table is deduplicated across the text and vector index (#2).
+        if self.id_field and self.id_field != "id":
+            cursor.execute(
+                f'CREATE UNIQUE INDEX IF NOT EXISTS uidx_docs_id ON docs ("{self.id_field}")'
+            )
+
         # Strategy-specific tables
         self._strategy.init_tables(cursor)
 
@@ -168,8 +180,17 @@ class VectorSearchIndex:
         return row["count"]
 
     def _is_empty(self) -> bool:
-        """Check if the index is empty."""
-        return self.count() == 0
+        """Check whether this index has any *vector* rows.
+
+        Counts rows carrying a vector rather than all of ``docs`` so that a
+        VectorSearchIndex can be fitted into a file whose ``docs`` table was
+        already populated (with NULL vector_hash) by a TextSearchIndex
+        (shared/hybrid file, issue #2).
+        """
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as count FROM docs WHERE vector_hash IS NOT NULL")
+        return cursor.fetchone()["count"] == 0
 
     def fit(
         self,
@@ -270,7 +291,17 @@ class VectorSearchIndex:
         # inserts into chunked multi-row statements, which matters for the
         # libsql/Turso backend where each statement is a network round-trip
         # (issue #3) -- the old per-row loop was one round-trip per document.
-        doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows)
+        if self.id_field and self.id_field != "id":
+            # Shared/hybrid file (#2): upsert by the user id so we reuse rows a
+            # TextSearchIndex may already have written, filling vector_hash,
+            # rather than duplicating them.
+            id_col = f'"{self.id_field}"'
+            bulk_upsert(cursor, "docs", all_cols, doc_rows, id_col, all_cols)
+            key_vals = [doc.get(self.id_field) for doc in payload]
+            id_map = fetch_ids_by_key(cursor, "docs", id_col, key_vals)
+            doc_ids = [id_map[str(v)] for v in key_vals]
+        else:
+            doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows)
 
         # Build strategy index
         if is_fit:
@@ -522,7 +553,8 @@ class VectorSearchIndex:
             ids_list = list(candidate_ids)
             rows = self._chunked_in_query(
                 cursor,
-                "SELECT id, doc_json, vector_hash FROM docs WHERE id IN ({placeholders})",
+                "SELECT id, doc_json, vector_hash FROM docs "
+                "WHERE id IN ({placeholders}) AND vector_hash IS NOT NULL",
                 ids_list,
             )
             if not rows:
@@ -572,7 +604,13 @@ class VectorSearchIndex:
     def _load_vector_cache(self) -> None:
         conn = self._get_conn()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, doc_json, vector_hash FROM docs ORDER BY id")
+        # Only rows that actually carry a vector. In a shared (hybrid) file the
+        # text index may have written rows with a NULL vector_hash; skip those
+        # so a cold load doesn't try to np.frombuffer(None) (issue #2).
+        cursor.execute(
+            "SELECT id, doc_json, vector_hash FROM docs "
+            "WHERE vector_hash IS NOT NULL ORDER BY id"
+        )
         rows = cursor.fetchall()
         if not rows:
             return

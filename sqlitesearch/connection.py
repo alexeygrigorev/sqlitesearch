@@ -80,6 +80,48 @@ def bulk_insert_returning_ids(cursor, table: str, columns: list, rows: list) -> 
     return ids
 
 
+def bulk_upsert(cursor, table: str, columns: list, rows: list, conflict_col: str, update_cols: list) -> None:
+    """Chunked multi-row ``INSERT ... ON CONFLICT(conflict_col) DO UPDATE``.
+
+    Used for shared/hybrid files (issue #2): documents are keyed by the user's
+    ``id_field`` so fitting the same corpus into both the text and vector index
+    updates the *same* row instead of duplicating it. ``conflict_col`` and the
+    members of ``update_cols`` must be pre-quoted column tokens.
+    """
+    if not rows:
+        return
+    n_cols = len(columns)
+    col_sql = ", ".join(columns)
+    row_ph = "(" + ", ".join(["?"] * n_cols) + ")"
+    set_sql = ", ".join(f"{c}=excluded.{c}" for c in update_cols)
+    for chunk in _chunk_rows(rows, n_cols):
+        values_sql = ", ".join([row_ph] * len(chunk))
+        flat = [v for row in chunk for v in row]
+        cursor.execute(
+            f"INSERT INTO {table} ({col_sql}) VALUES {values_sql} "
+            f"ON CONFLICT({conflict_col}) DO UPDATE SET {set_sql}",
+            flat,
+        )
+
+
+def fetch_ids_by_key(cursor, table: str, id_col: str, key_values: list) -> dict:
+    """Return ``{str(key_value): internal_id}`` for the given key column values.
+
+    Keys are normalised to ``str`` because the id column has TEXT affinity, so
+    e.g. an integer id ``100`` is stored (and read back) as ``"100"``; callers
+    look up with ``str(value)`` to avoid an int/str mismatch.
+    """
+    out: dict = {}
+    keys = list(key_values)
+    for i in range(0, len(keys), _MAX_SQL_VARS):
+        chunk = keys[i : i + _MAX_SQL_VARS]
+        ph = ",".join(["?"] * len(chunk))
+        cursor.execute(f"SELECT id, {id_col} FROM {table} WHERE {id_col} IN ({ph})", chunk)
+        for row in cursor.fetchall():
+            out[str(row[1])] = row[0]
+    return out
+
+
 class _Row:
     """A tuple that also supports ``row["column"]`` access, like sqlite3.Row."""
 
