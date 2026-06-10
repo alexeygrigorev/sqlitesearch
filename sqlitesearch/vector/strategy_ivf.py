@@ -11,6 +11,8 @@ from typing import Optional
 
 import numpy as np
 
+from sqlitesearch.connection import bulk_insert
+
 
 class IVFStrategy:
     """IVF search strategy using k-means clustering."""
@@ -93,19 +95,15 @@ class IVFStrategy:
         self._centroids = self._kmeans(normed, self.n_clusters)
 
         # Store centroids in DB
-        for cid in range(len(self._centroids)):
-            cursor.execute(
-                "INSERT INTO ivf_centroids (cluster_id, centroid) VALUES (?, ?)",
-                (cid, self._centroids[cid].tobytes()),
-            )
+        centroid_rows = [
+            (cid, self._centroids[cid].tobytes()) for cid in range(len(self._centroids))
+        ]
+        bulk_insert(cursor, "ivf_centroids", ["cluster_id", "centroid"], centroid_rows)
 
         # Assign vectors to nearest centroid
         assignments = self._assign(normed)  # (n,) array of cluster IDs
         rows = [(int(doc_ids[i]), int(assignments[i])) for i in range(n)]
-        cursor.executemany(
-            "INSERT INTO ivf_assignments (doc_id, cluster_id) VALUES (?, ?)",
-            rows,
-        )
+        bulk_insert(cursor, "ivf_assignments", ["doc_id", "cluster_id"], rows)
 
         # Save params
         self.save_params(cursor)
@@ -120,10 +118,7 @@ class IVFStrategy:
         normed = self._normalize(vectors)
         assignments = self._assign(normed)
         rows = [(int(doc_ids[i]), int(assignments[i])) for i in range(len(vectors))]
-        cursor.executemany(
-            "INSERT INTO ivf_assignments (doc_id, cluster_id) VALUES (?, ?)",
-            rows,
-        )
+        bulk_insert(cursor, "ivf_assignments", ["doc_id", "cluster_id"], rows)
 
     def find_candidates(self, cursor: sqlite3.Cursor, query_vector: np.ndarray) -> set[int]:
         """Find candidates by probing nearest clusters."""

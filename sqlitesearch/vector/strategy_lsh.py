@@ -10,6 +10,8 @@ from typing import Optional
 
 import numpy as np
 
+from sqlitesearch.connection import bulk_insert
+
 
 class LSHStrategy:
     """LSH search strategy using random projections."""
@@ -74,10 +76,7 @@ class LSHStrategy:
             for table_id in range(self.n_tables):
                 hash_key = self._signs_to_hash_str(all_signs[i, table_id])
                 lsh_rows.append((table_id, hash_key, doc_id))
-        cursor.executemany(
-            "INSERT INTO lsh_buckets (table_id, hash_key, doc_id) VALUES (?, ?, ?)",
-            lsh_rows,
-        )
+        bulk_insert(cursor, "lsh_buckets", ["table_id", "hash_key", "doc_id"], lsh_rows)
 
     def add_to_index(self, cursor: sqlite3.Cursor, vectors: np.ndarray, doc_ids: list[int]) -> None:
         # Same as build_index for LSH

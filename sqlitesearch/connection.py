@@ -25,6 +25,60 @@ _PRAGMAS = (
     "PRAGMA cache_size=-64000",
 )
 
+# Conservative cap below SQLite's historical SQLITE_MAX_VARIABLE_NUMBER (999)
+# so a multi-row INSERT never exceeds the bound on any backend/version.
+_MAX_SQL_VARS = 900
+
+
+def _chunk_rows(rows: list, n_cols: int):
+    max_rows = max(1, _MAX_SQL_VARS // max(1, n_cols))
+    for i in range(0, len(rows), max_rows):
+        yield rows[i : i + max_rows]
+
+
+def bulk_insert(cursor, table: str, columns: list, rows: list) -> None:
+    """Insert ``rows`` using chunked multi-row ``INSERT`` statements.
+
+    Equivalent to ``cursor.executemany`` but collapses each chunk of rows into a
+    single statement. Over the libsql/Turso embedded-replica backend, every
+    statement is a network round-trip to the remote primary, so an N-row
+    ``executemany`` becomes N round-trips. Batching turns that into ~N/chunk
+    round-trips (see issue #3). ``columns`` are pre-formatted column tokens;
+    ``rows`` is a list of equal-length value sequences.
+    """
+    if not rows:
+        return
+    n_cols = len(columns)
+    col_sql = ", ".join(columns)
+    row_ph = "(" + ", ".join(["?"] * n_cols) + ")"
+    for chunk in _chunk_rows(rows, n_cols):
+        values_sql = ", ".join([row_ph] * len(chunk))
+        flat = [v for row in chunk for v in row]
+        cursor.execute(f"INSERT INTO {table} ({col_sql}) VALUES {values_sql}", flat)
+
+
+def bulk_insert_returning_ids(cursor, table: str, columns: list, rows: list) -> list:
+    """Like :func:`bulk_insert`, returning the autoincrement ids of the inserted
+    rows in order.
+
+    Relies on a single writer and ``INTEGER PRIMARY KEY`` rowids being assigned
+    consecutively within each chunk (true for SQLite/libsql), so the chunk's ids
+    are ``[lastrowid - len(chunk) + 1 .. lastrowid]``.
+    """
+    ids: list = []
+    if not rows:
+        return ids
+    n_cols = len(columns)
+    col_sql = ", ".join(columns)
+    row_ph = "(" + ", ".join(["?"] * n_cols) + ")"
+    for chunk in _chunk_rows(rows, n_cols):
+        values_sql = ", ".join([row_ph] * len(chunk))
+        flat = [v for row in chunk for v in row]
+        cursor.execute(f"INSERT INTO {table} ({col_sql}) VALUES {values_sql}", flat)
+        last = cursor.lastrowid
+        ids.extend(range(last - len(chunk) + 1, last + 1))
+    return ids
+
 
 class _Row:
     """A tuple that also supports ``row["column"]`` access, like sqlite3.Row."""
