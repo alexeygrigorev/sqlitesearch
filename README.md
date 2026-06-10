@@ -177,19 +177,34 @@ Filtering works the same as text search - see the [Filtering](#filtering) sectio
 
 ## Hybrid Search
 
-Text and vector indexes can share the same database file, enabling hybrid search.
+Text and vector indexes can share the same database file, enabling hybrid search over a single `.db`. Pass an **`id_field`** to both indexes so they recognise the same documents and store them **once** in a shared `docs` table:
 
 ```python
 from sqlitesearch import TextSearchIndex, VectorSearchIndex
 
-text_index = TextSearchIndex(text_fields=["title", "description"], db_path="hybrid.db")
-vector_index = VectorSearchIndex(db_path="hybrid.db")
+docs = [{"doc_id": 1, "title": "Python", "description": "...", "category": "dev"}, ...]
 
-text_results = text_index.search("python tutorial")
-vector_results = vector_index.search(query_vector)
+# The vector index stores the documents (and their vectors)...
+vector_index = VectorSearchIndex(keyword_fields=["category"], id_field="doc_id", db_path="hybrid.db")
+vector_index.fit(query_vectors, docs)
 
-# Combine and deduplicate results based on your ranking strategy
+# ...and the text index builds its full-text index over the *same* rows.
+text_index = TextSearchIndex(text_fields=["title", "description"], keyword_fields=["category"],
+                             id_field="doc_id", db_path="hybrid.db")
+text_index.fit(docs)
+
+text_results = text_index.search("python tutorial", output_ids=True)
+vector_results = vector_index.search(query_vector, output_ids=True)
+
+# Combine the two result lists by their shared id (e.g. reciprocal rank fusion).
 ```
+
+**How it works:** both indexes use one `docs` table; the vector index fills a `vector_hash` column while the text index leaves it `NULL` and maintains the FTS5 table. When `id_field` is set, inserts **upsert by that id**, so fitting the same corpus into both indexes updates the same row instead of duplicating it — and results from both indexes line up by your `id`.
+
+**Caveats:**
+- The `id_field` is what ties the two indexes together. **Without it there is no key to deduplicate on**, so the same document fitted into both indexes is stored as two separate rows and you can only correlate results by re-matching your own fields. Provide `id_field` for hybrid use.
+- Use a field name **other than the reserved `id`** (that name is the internal row id); e.g. `"doc_id"`.
+- Configure both indexes with the same `keyword_fields` / `numeric_fields` / `date_fields` so the shared `docs` schema matches.
 
 ## Index Management
 
