@@ -102,33 +102,39 @@ uv run python benchmark/bench_backends.py --n 1000 10000 100000 --dim 64 --mode 
 
 Sweep (dim=64, LSH; machine-dependent):
 
+Sweep (dim=64, LSH; machine-dependent). `turso-local` (pyturso) is included to show why it was **evaluated and removed** — it does not scale:
+
 | n | backend | fit (s) | search (ms) | write round-trips |
 |--:|---|--:|--:|--:|
 | 1,000 | sqlite3 | 0.18 | 1.5 | – |
 | 1,000 | libsql-local | 0.20 | 2.4 | – |
+| 1,000 | turso-local (pyturso) | 0.43 | 42.7 | – |
 | 1,000 | libsql-replica | 0.32 | – | 26 |
 | 10,000 | sqlite3 | 1.16 | 1.3 | – |
 | 10,000 | libsql-local | 1.17 | 2.8 | – |
+| 10,000 | turso-local (pyturso) | 6.38 | 400.7 | – |
 | 10,000 | libsql-replica | 2.10 | – | 40 |
 | 100,000 | sqlite3 | 14.1 | 4.6 | – |
 | 100,000 | libsql-local | 10.7 | 5.9 | – |
+| 100,000 | turso-local (pyturso) | **388** | **5775** | – |
 | 100,000 | libsql-replica | 33.9 | – | **202** |
 
 Takeaways:
 - **`sqlite3` and `libsql` (local file) scale to 100k cleanly** — ~10–14 s to ingest, ~5 ms search.
 - The **libSQL embedded replica forwards every write to the remote**, so ingest cost is dominated by round-trips. Batched multi-row inserts (issues #3 / #13) keep this at **202 round-trips for 100k docs** instead of hundreds of thousands; ingest stays ~34 s.
+- **`pyturso` does not scale** — ingest and search grow super-linearly (388 s / 5.8 s-per-query at 100k vs 0.43 s / 43 ms at 1k, and ~11 s / ~6 ms for libSQL). The engine is early-stage, so the `turso` (pyturso) backend was **removed**; we may revisit if it matures. The numbers above are kept as the evidence.
 
-### pyturso (evaluated and removed)
+### Verified on actual Turso Cloud
 
-We also evaluated an in-process [`pyturso`](https://github.com/tursodatabase/turso) (tursodatabase/turso) backend. It worked for small data but **did not scale**, so support was **removed**:
+The libSQL embedded-replica numbers above use a local Turso emulator. We also ran batched ingest against a **real Turso Cloud** database (over the network, ~215 ms/round-trip):
 
-| n | fit (s) | search (ms/query) |
+| rows | batched ingest | per-row equivalent |
 |--:|--:|--:|
-| 1,000 | 0.43 | 42.7 |
-| 10,000 | 6.38 | 400.7 |
-| 100,000 | **388** | **5775** |
+| 2,000 | 1.1 s | ~7 min |
+| 10,000 | 1.6 s | ~36 min |
+| 100,000 | **6.3 s** | **~6 hours** |
 
-Both ingest and search grow super-linearly (vs ~11 s / ~6 ms for libSQL at 100k). The engine is early-stage; we may revisit if it matures.
+The batched multi-row inserts (#3 / #13) are what make 100k-scale ingest on Turso practical.
 
 ## Results directory
 
