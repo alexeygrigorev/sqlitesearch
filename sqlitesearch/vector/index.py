@@ -19,6 +19,7 @@ from sqlitesearch.connection import (
     bulk_upsert,
     connect,
     fetch_ids_by_key,
+    max_sql_vars,
 )
 
 from sqlitesearch.operators import OPERATORS, is_range_filter
@@ -71,6 +72,7 @@ class VectorSearchIndex:
         self.backend = backend
         self.sync_url = sync_url
         self.auth_token = auth_token
+        self._max_vars = max_sql_vars(backend)
         self._local = threading.local()
 
         # Expose LSH params as attributes for backward compatibility with tests
@@ -109,6 +111,9 @@ class VectorSearchIndex:
             )
         else:
             raise ValueError(f"Unknown mode: {mode}")
+
+        # Let the strategy size its bulk inserts for the backend too (#13).
+        self._strategy._max_vars = self._max_vars
 
         self._init_db()
 
@@ -296,12 +301,12 @@ class VectorSearchIndex:
             # TextSearchIndex may already have written, filling vector_hash,
             # rather than duplicating them.
             id_col = f'"{self.id_field}"'
-            bulk_upsert(cursor, "docs", all_cols, doc_rows, id_col, all_cols)
+            bulk_upsert(cursor, "docs", all_cols, doc_rows, id_col, all_cols, max_vars=self._max_vars)
             key_vals = [doc.get(self.id_field) for doc in payload]
-            id_map = fetch_ids_by_key(cursor, "docs", id_col, key_vals)
+            id_map = fetch_ids_by_key(cursor, "docs", id_col, key_vals, max_vars=self._max_vars)
             doc_ids = [id_map[str(v)] for v in key_vals]
         else:
-            doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows)
+            doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows, max_vars=self._max_vars)
 
         # Build strategy index
         if is_fit:
