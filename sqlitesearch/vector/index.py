@@ -19,6 +19,7 @@ from sqlitesearch.connection import (
     bulk_upsert,
     connect,
     fetch_ids_by_key,
+    is_remote_url,
     max_sql_vars,
 )
 
@@ -49,8 +50,8 @@ class VectorSearchIndex:
         id_field: Optional[str] = None,
         db_path: str = "sqlitesearch_vectors.db",
         backend: str = "sqlite3",
-        sync_url: Optional[str] = None,
         auth_token: Optional[str] = None,
+        replica_path: Optional[str] = None,
         # LSH params (kept as explicit kwargs for backward compatibility)
         n_tables: int = 8,
         hash_size: int = 16,
@@ -69,9 +70,14 @@ class VectorSearchIndex:
         self.date_fields = list(date_fields) if date_fields is not None else []
         self.id_field = id_field
         self.db_path = db_path
+        # A remote URL as db_path means a Turso embedded replica (set up in
+        # connect()). Treat it as the libsql backend here so bulk inserts use
+        # the network-sized batches.
+        if is_remote_url(db_path) and backend == "sqlite3":
+            backend = "libsql"
         self.backend = backend
-        self.sync_url = sync_url
         self.auth_token = auth_token
+        self.replica_path = replica_path
         self._max_vars = max_sql_vars(backend)
         self._local = threading.local()
 
@@ -123,8 +129,8 @@ class VectorSearchIndex:
             self._local.conn = connect(
                 self.db_path,
                 backend=self.backend,
-                sync_url=self.sync_url,
                 auth_token=self.auth_token,
+                replica_path=self.replica_path,
             )
         return self._local.conn
 

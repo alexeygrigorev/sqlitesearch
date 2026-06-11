@@ -12,12 +12,90 @@ The ``libsql`` client returns plain tuples and has no ``row_factory``, so this
 module wraps a libsql connection in thin adapters that make its rows behave
 like ``sqlite3.Row`` (named *and* positional access). That keeps every
 ``row["..."]`` access in the strategies working unchanged.
+
+Design note - why an embedded replica, not a direct remote connection
+---------------------------------------------------------------------
+With libsql, every statement against a remote database is a network round-trip
+to the Turso primary. Vector search is read-heavy: each query runs several
+index probes plus a rerank lookup, so a plain remote connection would put
+network latency on every one of those reads and make search slow.
+
+The embedded replica fixes the read side -- reads are served from a local
+SQLite file at disk speed. Writes still go *through* to the Turso primary on
+commit: libsql forwards each statement, and ``commit()`` is write-through, so
+an ingested row is durable on the remote immediately (verified against
+libsql 0.1.x). ``bulk_insert`` batches writes only to cut the *number* of
+round-trips, not to defer them. ``ConnectionWrapper.sync()`` is a
+read-freshness call that pulls changes *down* from the primary -- it is not a
+durability flush, so ingest does not depend on calling it.
+
+So the win is local-file read speed with Turso's durable, restart-surviving
+storage. The local replica file is therefore disposable -- ``connect`` defaults
+it to an ephemeral temp file when a ``libsql://`` URL is passed as ``db_path``,
+because the source of truth is always the remote primary, not the local copy.
+
+Note on remotes: the embedded replica bootstraps by pulling a snapshot through
+the Turso sync API (``GET /info`` + ``GET /export``). Turso Cloud serves that,
+so a ``libsql://...turso.io`` URL works. A stock self-hosted ``sqld`` currently
+speaks only Hrana and does not serve ``/export``, so the embedded replica will
+not bootstrap against it -- use Turso Cloud (or a server that serves the sync
+API) for the replica, or talk to a bare ``sqld`` in pure-remote mode instead.
 """
 
 from __future__ import annotations
 
+import hashlib
+import os
 import sqlite3
+import tempfile
 from typing import Any, Optional
+from urllib.parse import urlparse
+
+# URL schemes that mean "this is a remote Turso/libSQL database, not a local
+# file". When ``db_path`` uses one of these, sqlitesearch sets up the embedded
+# replica transparently (local temp file + sync) instead of asking the caller
+# to wire up ``sync_url``/``auth_token``/a replica path by hand.
+_REMOTE_SCHEMES = frozenset({"libsql", "https", "http", "wss", "ws"})
+
+
+def is_remote_url(target: Any) -> bool:
+    """True when ``target`` is a remote libSQL/Turso URL rather than a path."""
+    if not isinstance(target, str) or "://" not in target:
+        return False
+    return target.split("://", 1)[0].lower() in _REMOTE_SCHEMES
+
+
+def default_replica_path(sync_url: str) -> str:
+    """Pick an ephemeral local file to back an embedded replica of ``sync_url``.
+
+    The file lives in the system temp dir, so the caller never has to name,
+    create, or gitignore it. It is derived deterministically from the URL, so
+    every connection in a process reuses the same replica. On an ephemeral host
+    the temp file is gone after a restart and the replica simply re-syncs from
+    Turso on the next boot - which is what would happen on that disk anyway.
+    """
+    name = urlparse(sync_url).netloc or sync_url
+    digest = hashlib.sha1(sync_url.encode()).hexdigest()[:8]
+    safe = "".join(c if c.isalnum() else "-" for c in name)[:40].strip("-")
+    return os.path.join(tempfile.gettempdir(), f"sqlitesearch-{safe}-{digest}.db")
+
+
+def resolve_remote_target(
+    db_path: str,
+    replica_path: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
+    """Resolve a possibly-remote ``db_path`` into ``(local_db_path, sync_url)``.
+
+    Pure (no I/O). A remote URL becomes the sync target and is backed by a local
+    embedded-replica file (``replica_path`` or an ephemeral temp file). A local
+    path passes through with no sync target.
+    """
+    sync_url: Optional[str] = None
+    if is_remote_url(db_path):
+        sync_url = db_path
+        db_path = replica_path or default_replica_path(sync_url)
+    return db_path, sync_url
+
 
 _PRAGMAS = (
     "PRAGMA journal_mode=WAL",
@@ -227,33 +305,58 @@ def connect(
     db_path: str,
     *,
     backend: str = "sqlite3",
-    sync_url: Optional[str] = None,
     auth_token: Optional[str] = None,
+    replica_path: Optional[str] = None,
 ) -> Any:
     """Open a connection for sqlitesearch.
 
     Args:
-        db_path: Local database file path. With libsql this is the local file
-            (or local embedded-replica file when ``sync_url`` is set).
-        backend: ``"sqlite3"`` (default, stdlib) or ``"libsql"`` (local file or,
-            with ``sync_url``, a Turso Cloud embedded replica). Providing
-            ``sync_url`` implies ``"libsql"``.
-        sync_url: Turso database URL (``libsql://...``) for an embedded
-            replica. Reads hit the local file; writes sync to Turso.
-        auth_token: Turso auth token (used with ``sync_url``).
+        db_path: Either a local database file path, or a remote Turso/libSQL
+            URL (``libsql://...``). A URL is handled transparently: it becomes
+            the sync target for a local embedded replica, so reads stay local
+            and writes sync to the remote.
+        backend: ``"sqlite3"`` (default, stdlib) or ``"libsql"``. A remote
+            ``db_path`` implies ``"libsql"`` automatically.
+        auth_token: Auth token for an authenticated remote database (e.g.
+            Turso). Not needed for a local file or a local replica, and not
+            needed for unauthenticated libsql servers. The caller passes it
+            explicitly when required; the library never reads it from the
+            environment.
+        replica_path: Optional local file for the embedded replica. Defaults to
+            an ephemeral temp file derived from the URL, which the caller never
+            has to manage.
 
     Returns:
         A connection object exposing the sqlite3 API with ``sqlite3.Row``-style
         row access, regardless of backend.
     """
+    # Transparent remote: a URL given as db_path is a remote database. Use it as
+    # the sync target and back it with a local embedded replica (an ephemeral
+    # temp file unless replica_path is given).
+    db_path, sync_url = resolve_remote_target(db_path, replica_path)
+
     if sync_url:
         backend = "libsql"
+
+    # Make sure the database file's directory exists before opening it - for a
+    # local file or the embedded replica's local file alike - so callers never
+    # have to mkdir by hand.
+    if db_path and db_path != ":memory:":
+        parent = os.path.dirname(db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
 
     if backend == "libsql":
         import libsql
 
         if sync_url:
-            raw = libsql.connect(db_path, sync_url=sync_url, auth_token=auth_token)
+            # auth_token is optional: omit it when None so an unauthenticated
+            # remote works without a token, and to avoid libsql 0.1.x raising a
+            # TypeError on auth_token=None.
+            kwargs: dict[str, Any] = {"sync_url": sync_url}
+            if auth_token is not None:
+                kwargs["auth_token"] = auth_token
+            raw = libsql.connect(db_path, **kwargs)
             raw.sync()
         else:
             raw = libsql.connect(db_path)

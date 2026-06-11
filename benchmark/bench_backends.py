@@ -95,8 +95,8 @@ def bench_replica(n, dim, mode):
             # emulator can't replicate to the writing replica. The default
             # (lastrowid) ingest path is what we want to measure anyway.
             idx = VectorSearchIndex(
-                keyword_fields=["section"], db_path=_fresh_db(), mode=mode, seed=7,
-                backend="libsql", sync_url=emu.url, auth_token="x",
+                keyword_fields=["section"], db_path=emu.url, replica_path=_fresh_db(),
+                mode=mode, seed=7, auth_token="x",
             )
             t0 = time.perf_counter()
             idx.fit(vectors, docs)

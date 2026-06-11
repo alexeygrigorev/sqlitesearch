@@ -64,6 +64,12 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# Keep the slow, Docker-requiring integration suite out of the default run.
+# `uv run pytest -m integration` overrides this and selects only those tests.
+addopts = "-m 'not integration'"
+markers = [
+    "integration: real-Docker integration tests against a libsql-server (sqld) container; run with -m integration, skipped by default and when Docker is unavailable",
+]
 
 [tool.uv]
 exclude-newer = "7 days"

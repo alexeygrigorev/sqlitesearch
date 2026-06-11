@@ -1,0 +1,42 @@
+name: Integration
+
+# Real-Docker integration tests against a libsql-server (sqld) container.
+# Kept in a SEPARATE workflow/job from tests.yml so the fast unit matrix is
+# never blocked by Docker pulls or container startup.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Opt JS actions into Node 24 (silences the Node 20 deprecation warning).
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest  # GitHub-hosted Ubuntu runners ship with Docker
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      # Pre-pull so a slow/failed pull surfaces as its own step rather than a
+      # mid-test skip. The fixture also pulls and skips gracefully if absent.
+      - name: Pull libsql-server (sqld) image
+        run: docker pull ghcr.io/tursodatabase/libsql-server:latest
+
+      - name: Run integration tests
+        run: uv run pytest -m integration -v -s

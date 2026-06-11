@@ -59,9 +59,8 @@ def test_text_ingest_round_trips_bounded(emulator, monkeypatch):
     idx = TextSearchIndex(
         text_fields=["question", "answer", "section"],
         keyword_fields=["section"],
-        db_path=_fresh_db(),
-        backend="libsql",
-        sync_url=emulator.url,
+        db_path=emulator.url,
+        replica_path=_fresh_db(),
         auth_token="x",
     )
     idx.fit(DOCS)
@@ -76,11 +75,10 @@ def test_vector_ingest_round_trips_bounded(emulator, monkeypatch, mode):
     vectors = np.random.default_rng(0).standard_normal((N, 32)).astype(np.float32)
     idx = VectorSearchIndex(
         keyword_fields=["section"],
-        db_path=_fresh_db(),
+        db_path=emulator.url,
+        replica_path=_fresh_db(),
         mode=mode,
         seed=1,
-        backend="libsql",
-        sync_url=emulator.url,
         auth_token="x",
     )
     idx.fit(vectors, DOCS)
@@ -88,6 +86,38 @@ def test_vector_ingest_round_trips_bounded(emulator, monkeypatch, mode):
     # Naive ingest (per-row docs + per-row index rows) is hundreds-to-thousands
     # of round-trips; batching keeps it well under the doc count.
     assert round_trips < N, f"too many round-trips for {mode}: {round_trips} for {N} docs"
+
+
+def test_remote_connect_without_auth_token(emulator, monkeypatch):
+    """A remote URL with NO auth token connects and writes reach the emulator.
+
+    The emulator is unauthenticated, so the caller omits ``auth_token`` entirely.
+    libsql 0.1.x raises ``TypeError`` if ``auth_token=None`` is passed to
+    ``libsql.connect``; ``connect()`` guards against that by omitting the kwarg
+    when it is None. This test exercises exactly that None path (note: no
+    ``auth_token=`` argument below) -- before the guard it raised TypeError; now
+    it connects and the rows land on the server.
+    """
+    monkeypatch.setattr(VectorSearchIndex, "_is_empty", lambda self: True)
+    vectors = np.random.default_rng(0).standard_normal((N, 32)).astype(np.float32)
+    idx = VectorSearchIndex(
+        keyword_fields=["section"],
+        db_path=emulator.url,
+        replica_path=_fresh_db(),
+        mode="lsh",
+        seed=1,
+        # auth_token intentionally omitted -> connect() must skip the kwarg
+    )
+    idx.fit(vectors, DOCS)
+
+    # The writes were forwarded to the emulator over Hrana: a fresh, independent
+    # libsql client bootstrapping from /export sees all N docs.
+    import libsql
+
+    fresh = libsql.connect(_fresh_db(), sync_url=emulator.url)
+    fresh.sync()
+    server_count = fresh.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+    assert server_count == N, f"server has {server_count} rows, expected {N}"
 
 
 def test_emulator_cold_reload_persists():

@@ -317,7 +317,7 @@ class EmulatorProcess:
     the emulator in its own process avoids that. Use this from tests/benchmarks::
 
         with EmulatorProcess() as emu:
-            idx = VectorSearchIndex(..., backend="libsql", sync_url=emu.url)
+            idx = VectorSearchIndex(..., db_path=emu.url, replica_path="replica.db")
             idx.fit(vectors, docs)
             print(emu.stats()["push_count"])  # write round-trips
     """
