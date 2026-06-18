@@ -6,7 +6,6 @@ Uses random projections for approximate nearest neighbor search.
 
 import pickle
 import sqlite3
-from typing import Optional
 
 import numpy as np
 
@@ -21,16 +20,16 @@ class LSHStrategy:
         n_tables: int = 8,
         hash_size: int = 16,
         n_probe: int = 2,
-        seed: Optional[int] = None,
+        seed: int | None = None,
     ):
         self.n_tables = n_tables
         self.hash_size = hash_size
         self.n_probe = n_probe
         self._seed = seed
 
-        self._dimension: Optional[int] = None
-        self._random_vectors: Optional[np.ndarray] = None  # (n_tables, hash_size, dim)
-        self._random_vectors_flat: Optional[np.ndarray] = None  # (n_tables*hash_size, dim)
+        self._dimension: int | None = None
+        self._random_vectors: np.ndarray | None = None  # (n_tables, hash_size, dim)
+        self._random_vectors_flat: np.ndarray | None = None  # (n_tables*hash_size, dim)
 
     def init_tables(self, cursor: sqlite3.Cursor) -> None:
         cursor.execute("""

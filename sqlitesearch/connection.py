@@ -48,7 +48,7 @@ import hashlib
 import os
 import sqlite3
 import tempfile
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 # URL schemes that mean "this is a remote Turso/libSQL database, not a local
@@ -82,15 +82,15 @@ def default_replica_path(sync_url: str) -> str:
 
 def resolve_remote_target(
     db_path: str,
-    replica_path: Optional[str] = None,
-) -> tuple[str, Optional[str]]:
+    replica_path: str | None = None,
+) -> tuple[str, str | None]:
     """Resolve a possibly-remote ``db_path`` into ``(local_db_path, sync_url)``.
 
     Pure (no I/O). A remote URL becomes the sync target and is backed by a local
     embedded-replica file (``replica_path`` or an ephemeral temp file). A local
     path passes through with no sync target.
     """
-    sync_url: Optional[str] = None
+    sync_url: str | None = None
     if is_remote_url(db_path):
         sync_url = db_path
         db_path = replica_path or default_replica_path(sync_url)
@@ -305,8 +305,8 @@ def connect(
     db_path: str,
     *,
     backend: str = "sqlite3",
-    auth_token: Optional[str] = None,
-    replica_path: Optional[str] = None,
+    auth_token: str | None = None,
+    replica_path: str | None = None,
 ) -> Any:
     """Open a connection for sqlitesearch.
 

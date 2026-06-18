@@ -97,6 +97,35 @@ class TestTextSearchIndexBasics:
         results = index.search("python", filter_dict={"course": "nonexistent"})
         assert len(results) == 0
 
+    def test_search_with_multi_value_filter(self, text_fields, keyword_fields, sample_docs, temp_db):
+        """Test search with multi-value (IN/OR) keyword filters."""
+        index = TextSearchIndex(text_fields, keyword_fields, db_path=temp_db)
+        index.fit(sample_docs)
+
+        # List value -> IN / OR within the field
+        results = index.search(
+            "python", filter_dict={"course": ["python-basics", "ml-basics"]}
+        )
+        assert len(results) > 0
+        assert all(doc["course"] in {"python-basics", "ml-basics"} for doc in results)
+
+        # A non-matching value in the list is simply ignored
+        results = index.search(
+            "python", filter_dict={"course": ["python-basics", "nonexistent"]}
+        )
+        assert len(results) > 0
+        assert all(doc["course"] == "python-basics" for doc in results)
+
+        # Tuple and set work the same as list
+        results = index.search("python", filter_dict={"course": ("python-basics",)})
+        assert all(doc["course"] == "python-basics" for doc in results)
+        results = index.search("python", filter_dict={"course": {"python-basics"}})
+        assert all(doc["course"] == "python-basics" for doc in results)
+
+        # Empty list matches nothing
+        results = index.search("python", filter_dict={"course": []})
+        assert len(results) == 0
+
     def test_search_with_boosts(self, text_fields, keyword_fields, sample_docs, temp_db):
         """Test search with field boosts."""
         index = TextSearchIndex(text_fields, keyword_fields, db_path=temp_db)

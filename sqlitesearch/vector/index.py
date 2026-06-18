@@ -10,7 +10,7 @@ import pickle
 import sqlite3
 import threading
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
@@ -22,7 +22,6 @@ from sqlitesearch.connection import (
     is_remote_url,
     max_sql_vars,
 )
-
 from sqlitesearch.operators import OPERATORS, is_range_filter
 from sqlitesearch.vector.base import VectorMode
 from sqlitesearch.vector.strategy_lsh import LSHStrategy
@@ -44,21 +43,21 @@ class VectorSearchIndex:
     def __init__(
         self,
         mode: str = "lsh",
-        keyword_fields: Optional[list[str]] = None,
-        numeric_fields: Optional[list[str]] = None,
-        date_fields: Optional[list[str]] = None,
-        id_field: Optional[str] = None,
+        keyword_fields: list[str] | None = None,
+        numeric_fields: list[str] | None = None,
+        date_fields: list[str] | None = None,
+        id_field: str | None = None,
         db_path: str = "sqlitesearch_vectors.db",
         backend: str = "sqlite3",
-        auth_token: Optional[str] = None,
-        replica_path: Optional[str] = None,
+        auth_token: str | None = None,
+        replica_path: str | None = None,
         # LSH params (kept as explicit kwargs for backward compatibility)
         n_tables: int = 8,
         hash_size: int = 16,
         n_probe: int = 2,
-        seed: Optional[int] = None,
+        seed: int | None = None,
         # IVF params
-        n_clusters: Optional[int] = None,
+        n_clusters: int | None = None,
         n_probe_clusters: int = 4,
         # HNSW params
         m: int = 16,
@@ -87,11 +86,11 @@ class VectorSearchIndex:
         self.n_probe = n_probe
 
         # In-memory vector cache for fast reranking
-        self._dimension: Optional[int] = None
-        self._cached_vectors: Optional[np.ndarray] = None
-        self._cached_doc_ids: Optional[list[int]] = None
-        self._cached_docs: Optional[list[dict]] = None
-        self._id_to_cache_idx: Optional[dict[int, int]] = None
+        self._dimension: int | None = None
+        self._cached_vectors: np.ndarray | None = None
+        self._cached_doc_ids: list[int] | None = None
+        self._cached_docs: list[dict] | None = None
+        self._id_to_cache_idx: dict[int, int] | None = None
 
         # Add id_field to keyword_fields if provided and not already there
         if self.id_field and self.id_field not in self.keyword_fields:
@@ -365,7 +364,7 @@ class VectorSearchIndex:
     def search(
         self,
         query_vector: np.ndarray,
-        filter_dict: Optional[dict[str, Any]] = None,
+        filter_dict: dict[str, Any] | None = None,
         num_results: int = 10,
         output_ids: bool = False,
     ) -> list[dict[str, Any]]:
@@ -445,6 +444,22 @@ class VectorSearchIndex:
                         f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" IS NULL',
                         ids_list,
                     )
+                    valid_ids = set(row["id"] for row in rows)
+                elif isinstance(value, (list, tuple, set)):
+                    # Multi-value membership: field matches ANY of these values.
+                    values = list(value)
+                    if not values:
+                        # Empty list matches nothing.
+                        valid_ids = set()
+                    else:
+                        ph = ", ".join("?" for _ in values)
+                        rows = self._chunked_in_query(
+                            cursor,
+                            f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" IN ({ph})',
+                            ids_list,
+                            values,
+                        )
+                        valid_ids = set(row["id"] for row in rows)
                 else:
                     rows = self._chunked_in_query(
                         cursor,
@@ -452,7 +467,7 @@ class VectorSearchIndex:
                         ids_list,
                         [value],
                     )
-                valid_ids = set(row["id"] for row in rows)
+                    valid_ids = set(row["id"] for row in rows)
                 filtered_ids &= valid_ids
             elif field in self.numeric_fields:
                 filtered_ids = self._apply_numeric_filter(cursor, field, value, filtered_ids)
@@ -490,7 +505,7 @@ class VectorSearchIndex:
             else:
                 rows = self._chunked_in_query(
                     cursor,
-                    f"SELECT id FROM docs WHERE id IN ({{placeholders}})",
+                    "SELECT id FROM docs WHERE id IN ({placeholders})",
                     ids_list,
                 )
         else:
@@ -533,7 +548,7 @@ class VectorSearchIndex:
             else:
                 rows = self._chunked_in_query(
                     cursor,
-                    f"SELECT id FROM docs WHERE id IN ({{placeholders}})",
+                    "SELECT id FROM docs WHERE id IN ({placeholders})",
                     ids_list,
                 )
         else:

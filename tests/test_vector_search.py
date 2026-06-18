@@ -206,6 +206,48 @@ class TestVectorSearchIndexFiltering:
         results = index.search(query, filter_dict={"category": "nonexistent"})
         assert len(results) == 0
 
+    def test_multi_value_filter(self, temp_db):
+        """Test multi-value (IN/OR) keyword filtering."""
+        vectors = np.random.randn(4, 64).astype(np.float32)
+        payload = [
+            {"id": 1, "category": "dev", "level": "beginner"},
+            {"id": 2, "category": "data", "level": "intermediate"},
+            {"id": 3, "category": "ai", "level": "advanced"},
+            {"id": 4, "category": "data", "level": "beginner"}
+        ]
+
+        index = VectorSearchIndex(keyword_fields=["category", "level"], db_path=temp_db)
+        index.fit(vectors, payload)
+
+        query = vectors[0]
+
+        # List value -> IN / OR within the field
+        results = index.search(query, filter_dict={"category": ["dev", "data"]})
+        assert len(results) > 0
+        assert all(doc["category"] in {"dev", "data"} for doc in results)
+
+        # A non-matching value in the list is simply ignored
+        results = index.search(query, filter_dict={"category": ["dev", "nonexistent"]})
+        assert all(doc["category"] == "dev" for doc in results)
+
+        # Tuple and set behave like list
+        results = index.search(query, filter_dict={"category": ("dev",)})
+        assert all(doc["category"] == "dev" for doc in results)
+        results = index.search(query, filter_dict={"category": {"dev"}})
+        assert all(doc["category"] == "dev" for doc in results)
+
+        # Multi-value AND scalar across fields combine with AND
+        results = index.search(
+            query, filter_dict={"category": ["data", "dev"], "level": "beginner"}
+        )
+        for doc in results:
+            assert doc["category"] in {"data", "dev"}
+            assert doc["level"] == "beginner"
+
+        # Empty list matches nothing
+        results = index.search(query, filter_dict={"category": []})
+        assert len(results) == 0
+
 
 class TestVectorSearchIndexAdd:
     """Test add() functionality."""

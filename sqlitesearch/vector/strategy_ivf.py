@@ -7,7 +7,6 @@ Clusters vectors using k-means, then at query time searches only the nearest clu
 import math
 import pickle
 import sqlite3
-from typing import Optional
 
 import numpy as np
 
@@ -19,17 +18,17 @@ class IVFStrategy:
 
     def __init__(
         self,
-        n_clusters: Optional[int] = None,
+        n_clusters: int | None = None,
         n_probe_clusters: int = 4,
-        seed: Optional[int] = None,
+        seed: int | None = None,
     ):
         self._n_clusters_param = n_clusters  # None = auto-scale
-        self.n_clusters: Optional[int] = n_clusters
+        self.n_clusters: int | None = n_clusters
         self.n_probe_clusters = n_probe_clusters
         self._seed = seed
 
-        self._dimension: Optional[int] = None
-        self._centroids: Optional[np.ndarray] = None  # (n_clusters, dim), normalized
+        self._dimension: int | None = None
+        self._centroids: np.ndarray | None = None  # (n_clusters, dim), normalized
 
     def init_tables(self, cursor: sqlite3.Cursor) -> None:
         cursor.execute("""

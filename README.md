@@ -48,6 +48,9 @@ for result in results:
 # Filter by keyword fields
 results = index.search("python", filter_dict={"category": "tutorial"})
 
+# Multi-value (IN/OR) keyword filter: match any of the listed values
+results = index.search("python", filter_dict={"category": ["tutorial", "guide"]})
+
 # Filter by numeric range
 results = index.search("python", filter_dict={"price": [('>=', 50), ('<', 200)]})
 

@@ -10,18 +10,18 @@ Stemming example with minsearch (optional dependency):
 """
 
 import re
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Literal, Optional, Union
+from typing import Literal
 
-
-StopWordsOption = Union[Literal['english'], set[str]]
+StopWordsOption = Literal['english'] | set[str]
 
 
 def _load_stop_words() -> set[str]:
     """Load stop words from stop_words.txt file."""
     module_dir = Path(__file__).parent
     stop_words_path = module_dir / "stop_words.txt"
-    with open(stop_words_path, "r", encoding="utf-8") as f:
+    with open(stop_words_path, encoding="utf-8") as f:
         return {line.strip() for line in f if line.strip()}
 
 
@@ -58,8 +58,8 @@ class Tokenizer:
     def __init__(
         self,
         pattern: str = r"[\s\W\d]+",
-        stop_words: Optional[StopWordsOption] = None,
-        stemmer: Optional[Callable[[str], str]] = None,
+        stop_words: StopWordsOption | None = None,
+        stemmer: Callable[[str], str] | None = None,
     ):
         """
         Initialize the tokenizer.

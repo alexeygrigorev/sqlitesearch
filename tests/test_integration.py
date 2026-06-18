@@ -9,8 +9,8 @@ import tempfile
 
 import pytest
 import requests
-
 from minsearch import Index as MinsearchIndex
+
 from sqlitesearch import TextSearchIndex
 
 

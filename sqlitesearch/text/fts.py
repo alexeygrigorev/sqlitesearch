@@ -9,7 +9,7 @@ import json
 import sqlite3
 import threading
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Any
 
 from sqlitesearch.connection import (
     bulk_insert,
@@ -53,16 +53,16 @@ class TextSearchIndex:
     def __init__(
         self,
         text_fields: list[str],
-        keyword_fields: Optional[list[str]] = None,
-        numeric_fields: Optional[list[str]] = None,
-        date_fields: Optional[list[str]] = None,
-        id_field: Optional[str] = None,
+        keyword_fields: list[str] | None = None,
+        numeric_fields: list[str] | None = None,
+        date_fields: list[str] | None = None,
+        id_field: str | None = None,
         db_path: str = "sqlitesearch.db",
         stemming: bool = False,
-        tokenizer: Optional[Tokenizer] = None,
+        tokenizer: Tokenizer | None = None,
         backend: str = "sqlite3",
-        auth_token: Optional[str] = None,
-        replica_path: Optional[str] = None,
+        auth_token: str | None = None,
+        replica_path: str | None = None,
     ):
         """
         Initialize the TextSearchIndex.
@@ -335,8 +335,8 @@ class TextSearchIndex:
     def search(
         self,
         query: str,
-        filter_dict: Optional[dict[str, Any]] = None,
-        boost_dict: Optional[dict[str, float]] = None,
+        filter_dict: dict[str, Any] | None = None,
+        boost_dict: dict[str, float] | None = None,
         num_results: int = 10,
         output_ids: bool = False,
     ) -> list[dict[str, Any]]:
@@ -347,6 +347,7 @@ class TextSearchIndex:
             query: The search query string. Supports FTS5 query syntax.
             filter_dict: Dictionary of filters. Can include:
                 - Keyword fields: {"field": "value"} for exact match
+                - Keyword fields: {"field": ["a", "b"]} for IN/OR (match any value)
                 - Numeric fields: {"field": [('>=', 100), ('<', 200)]} for range filters
                 - Numeric fields: {"field": 100} for exact match
                 - Date fields: {"field": [('>=', date(...)), ('<', date(...))]} for range filters
@@ -382,9 +383,19 @@ class TextSearchIndex:
 
         for field, value in filter_dict.items():
             if field in self.keyword_fields:
-                # Keyword field filters (exact match)
+                # Keyword field filters (exact match or IN/OR for list/tuple/set)
                 if value is None:
                     where_clauses.append(f'd."{field}" IS NULL')
+                elif isinstance(value, (list, tuple, set)):
+                    # Multi-value membership: field matches ANY of these values.
+                    values = list(value)
+                    if not values:
+                        # Empty list matches nothing.
+                        where_clauses.append("0")
+                    else:
+                        placeholders = ", ".join("?" for _ in values)
+                        where_clauses.append(f'd."{field}" IN ({placeholders})')
+                        where_params.extend(values)
                 else:
                     where_clauses.append(f'd."{field}" = ?')
                     where_params.append(value)
@@ -419,7 +430,7 @@ class TextSearchIndex:
             cursor.execute(search_query, [fts_query] + where_params + [num_results])
         else:
             # No filters: rank in FTS5 first, then join only top results
-            search_query = f"""
+            search_query = """
                 SELECT
                     top.docid,
                     d.doc_json

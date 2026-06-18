@@ -11,7 +11,6 @@ import heapq
 import math
 import pickle
 import sqlite3
-from typing import Optional
 
 import numpy as np
 
@@ -24,7 +23,7 @@ class HNSWStrategy:
         m: int = 20,
         ef_construction: int = 64,
         ef_search: int = 200,
-        seed: Optional[int] = None,
+        seed: int | None = None,
     ):
         self.m = m
         self.m_max0 = m * 2  # max connections at layer 0
@@ -32,14 +31,14 @@ class HNSWStrategy:
         self.ef_search = ef_search
         self._seed = seed
 
-        self._dimension: Optional[int] = None
-        self._entry_point: Optional[int] = None
+        self._dimension: int | None = None
+        self._entry_point: int | None = None
         self._max_layer: int = 0
         self._ml = 1.0 / math.log(m) if m > 1 else 1.0
 
         # Layer 0: numpy arrays (hot path)
-        self._adj: Optional[np.ndarray] = None  # (capacity, m_max0) int32
-        self._adj_count: Optional[np.ndarray] = None  # (capacity,) int32
+        self._adj: np.ndarray | None = None  # (capacity, m_max0) int32
+        self._adj_count: np.ndarray | None = None  # (capacity,) int32
         self._capacity: int = 0
 
         # Upper layers: dict (sparse, rarely accessed)
@@ -48,9 +47,9 @@ class HNSWStrategy:
         self._graph_loaded = False
 
         # Normalized vectors (contiguous numpy array)
-        self._vectors: Optional[np.ndarray] = None
-        self._doc_ids: Optional[list[int]] = None
-        self._id_to_idx: Optional[dict[int, int]] = None
+        self._vectors: np.ndarray | None = None
+        self._doc_ids: list[int] | None = None
+        self._id_to_idx: dict[int, int] | None = None
         self._n_nodes: int = 0
 
     def init_tables(self, cursor: sqlite3.Cursor) -> None:
@@ -428,10 +427,10 @@ class HNSWStrategy:
         if self._entry_point is None:
             self._entry_point = idx
             self._max_layer = level
-            for l in range(1, level + 1):
-                if l not in self._upper:
-                    self._upper[l] = {}
-                self._upper[l][idx] = []
+            for layer in range(1, level + 1):
+                if layer not in self._upper:
+                    self._upper[layer] = {}
+                self._upper[layer][idx] = []
             return
 
         q_vec = vecs[idx]
@@ -512,10 +511,10 @@ class HNSWStrategy:
         if self._entry_point is None:
             self._entry_point = idx
             self._max_layer = level
-            for l in range(1, level + 1):
-                if l not in self._upper:
-                    self._upper[l] = {}
-                self._upper[l][idx] = []
+            for layer in range(1, level + 1):
+                if layer not in self._upper:
+                    self._upper[layer] = {}
+                self._upper[layer][idx] = []
             return gen
 
         q_vec = vecs[idx]

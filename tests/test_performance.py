@@ -150,7 +150,7 @@ class TestTextSearchPerformance:
                 {
                     "id": 10000 + i,
                     "title": f"New Document {i}",
-                    "description": f"A newly added document about python",
+                    "description": "A newly added document about python",
                     "topic": "python",
                 }
                 for i in range(100)
@@ -267,7 +267,7 @@ class TestVectorSearchPerformance:
                 query_vector = large_vectors[query_idx]
 
                 start = time.time()
-                results = index.search(query_vector, num_results=5)
+                index.search(query_vector, num_results=5)
                 search_time = time.time() - start
                 total_time += search_time
 
@@ -409,7 +409,7 @@ class TestCombinedPerformance:
 
             vec_results = vec_index.search(large_vectors[0], num_results=10)
 
-            print(f"\n--- Performance Summary for 10,000 documents ---")
+            print("\n--- Performance Summary for 10,000 documents ---")
             print(f"Text search fit time: {text_fit_time:.2f}s")
             print(f"Text search results: {len(text_results)}")
             print(f"Vector search fit time (1024-dim): {vec_fit_time:.2f}s")
