@@ -26,6 +26,13 @@ from sqlitesearch.operators import OPERATORS, is_range_filter
 from sqlitesearch.vector.base import VectorMode
 from sqlitesearch.vector.strategy_lsh import LSHStrategy
 
+# When a filter matches at most this many vectors, skip the ANN index and run
+# an exact cosine rerank over the filtered subset (cheap: vectors are cached in
+# memory). Beyond it, fall back to the ANN path with adaptive over-fetch.
+# Cardinality-aware filtering mirrors what Qdrant/Milvus/pgvector do: exact scan
+# for selective filters, filtered ANN otherwise.
+_DEFAULT_EXACT_FILTER_THRESHOLD = 20_000
+
 
 class VectorSearchIndex:
     """
@@ -63,6 +70,10 @@ class VectorSearchIndex:
         m: int = 16,
         ef_construction: int = 200,
         ef_search: int = 50,
+        # Filtered search: max filtered-subset size for the exact-scan branch.
+        # None -> _DEFAULT_EXACT_FILTER_THRESHOLD. Set 0 to always use the ANN
+        # path for filtered queries.
+        exact_filter_threshold: int | None = None,
     ):
         self.keyword_fields = list(keyword_fields) if keyword_fields is not None else []
         self.numeric_fields = list(numeric_fields) if numeric_fields is not None else []
@@ -98,6 +109,8 @@ class VectorSearchIndex:
 
         # Create strategy
         mode_enum = VectorMode(mode)
+        self._mode = mode_enum
+        self._exact_filter_threshold = exact_filter_threshold
         if mode_enum == VectorMode.LSH:
             self._strategy = LSHStrategy(
                 n_tables=n_tables, hash_size=hash_size, n_probe=n_probe, seed=seed
@@ -181,10 +194,16 @@ class VectorSearchIndex:
 
         conn.commit()
 
-    def count(self) -> int:
-        """Return the number of documents in the index."""
+    def count(self, filter_dict: dict[str, Any] | None = None) -> int:
+        """Return the number of documents in the index.
+
+        With a ``filter_dict``, count only the vector rows matching it (the same
+        semantics used by the filtered-search planner).
+        """
         conn = self._get_conn()
         cursor = conn.cursor()
+        if filter_dict:
+            return self._count_filtered(cursor, filter_dict)
         cursor.execute("SELECT COUNT(*) as count FROM docs")
         row = cursor.fetchone()
         return row["count"]
@@ -306,12 +325,16 @@ class VectorSearchIndex:
             # TextSearchIndex may already have written, filling vector_hash,
             # rather than duplicating them.
             id_col = f'"{self.id_field}"'
-            bulk_upsert(cursor, "docs", all_cols, doc_rows, id_col, all_cols, max_vars=self._max_vars)
+            bulk_upsert(
+                cursor, "docs", all_cols, doc_rows, id_col, all_cols, max_vars=self._max_vars
+            )
             key_vals = [doc.get(self.id_field) for doc in payload]
             id_map = fetch_ids_by_key(cursor, "docs", id_col, key_vals, max_vars=self._max_vars)
             doc_ids = [id_map[str(v)] for v in key_vals]
         else:
-            doc_ids = bulk_insert_returning_ids(cursor, "docs", all_cols, doc_rows, max_vars=self._max_vars)
+            doc_ids = bulk_insert_returning_ids(
+                cursor, "docs", all_cols, doc_rows, max_vars=self._max_vars
+            )
 
         # Build strategy index
         if is_fit:
@@ -368,7 +391,16 @@ class VectorSearchIndex:
         num_results: int = 10,
         output_ids: bool = False,
     ) -> list[dict[str, Any]]:
-        """Search the index with the given query vector."""
+        """Search the index with the given query vector.
+
+        When a ``filter_dict`` is supplied, a cardinality-aware planner picks
+        the strategy: for selective filters (matching at most
+        ``exact_filter_threshold`` vectors) it skips the ANN index and runs an
+        exact cosine rerank over the filtered subset (always correct); for
+        non-selective filters it uses the ANN path with adaptive over-fetch so
+        the post-filter result set isn't starved. Unfiltered search is
+        unchanged.
+        """
         if filter_dict is None:
             filter_dict = {}
 
@@ -392,29 +424,96 @@ class VectorSearchIndex:
         conn = self._get_conn()
         cursor = conn.cursor()
 
-        # Step 1: Find candidates via strategy
-        candidate_ids = self._strategy.find_candidates(cursor, query_vector)
+        # No filter: standard ANN path (unchanged, no planner overhead).
+        if not filter_dict:
+            candidate_ids = self._strategy.find_candidates(cursor, query_vector)
+            if not candidate_ids:
+                return []
+            return self._rerank(cursor, query_vector, candidate_ids, num_results, output_ids)
 
-        if not candidate_ids:
+        # Filtered path: cardinality-aware planner.
+        filtered_count = self._count_filtered(cursor, filter_dict)
+        if filtered_count == 0:
             return []
 
-        # Step 2: Apply filters
-        candidate_ids = self._apply_filters(cursor, candidate_ids, filter_dict)
+        threshold = (
+            _DEFAULT_EXACT_FILTER_THRESHOLD
+            if self._exact_filter_threshold is None
+            else self._exact_filter_threshold
+        )
 
-        if not candidate_ids:
-            return []
+        if filtered_count <= threshold:
+            # Selective filter: exact cosine over the filtered subset. Cheap
+            # because vectors are cached in memory and _rerank already does
+            # exact cosine over an arbitrary id set.
+            filtered_ids = self._enumerate_filtered_ids(cursor, filter_dict)
+            if not filtered_ids:
+                return []
+            return self._rerank(cursor, query_vector, filtered_ids, num_results, output_ids)
 
-        # Step 3: Exact reranking
-        results = self._rerank(cursor, query_vector, candidate_ids, num_results, output_ids)
+        # Non-selective filter: ANN candidates -> filter -> adaptive over-fetch.
+        return self._filtered_ann_search(cursor, query_vector, filter_dict, num_results, output_ids)
 
-        return results
+    def _filtered_ann_search(
+        self,
+        cursor: sqlite3.Cursor,
+        query_vector: np.ndarray,
+        filter_dict: dict[str, Any],
+        num_results: int,
+        output_ids: bool,
+    ) -> list[dict[str, Any]]:
+        """ANN search widened until the post-filter result set is large enough.
+
+        Mirrors Milvus "iterative filter" / pgvector "iterative index scans": if
+        the post-filter survivors are fewer than ``num_results``, bump the
+        strategy's candidate budget and retry. The budget is restored in a
+        ``finally`` so a transient widening can't leak across searches (the
+        strategy object is shared across threads; connections are thread-local).
+        """
+        knob, cap = self._ann_budget_knob_and_cap()
+        original = getattr(self._strategy, knob)
+        current = original
+        try:
+            survivors: set[int] = set()
+            while True:
+                setattr(self._strategy, knob, current)
+                candidate_ids = self._strategy.find_candidates(cursor, query_vector)
+                survivors = self._apply_filters(cursor, candidate_ids, filter_dict)
+                if len(survivors) >= num_results or current >= cap:
+                    break
+                nxt = min(current * 2, cap)
+                if nxt <= current:
+                    break  # can't widen further
+                current = nxt
+            if not survivors:
+                return []
+            return self._rerank(cursor, query_vector, survivors, num_results, output_ids)
+        finally:
+            setattr(self._strategy, knob, original)
+
+    def _ann_budget_knob_and_cap(self) -> tuple[str, int]:
+        """Return (strategy attribute to widen, max useful value) by mode."""
+        if self._mode == VectorMode.HNSW:
+            n_nodes = getattr(self._strategy, "_n_nodes", 0) or 0
+            return ("ef_search", min(max(n_nodes, 1), 10_000))
+        if self._mode == VectorMode.IVF:
+            centroids = getattr(self._strategy, "_centroids", None)
+            cap = len(centroids) if centroids is not None else 4
+            return ("n_probe_clusters", max(cap, 1))
+        # LSH: n_probe beyond ~2 adds no probe keys (1-/2-bit flips), so the
+        # retry converges fast; selective filters are handled by the exact
+        # branch anyway.
+        return ("n_probe", 2)
 
     # --- Shared internal methods ---
 
-    @staticmethod
-    def _chunked_in_query(cursor, sql_template, ids_list, extra_params=None, chunk_size=900):
+    def _chunked_in_query(self, cursor, sql_template, ids_list, extra_params=None, chunk_size=None):
         if extra_params is None:
             extra_params = []
+        # Respect the backend's variable limit (900 for sqlite3, 30000 for the
+        # libsql/Turso network backend) instead of a hardcoded 900.
+        if chunk_size is None:
+            chunk_size = self._max_vars
         all_rows = []
         for i in range(0, len(ids_list), chunk_size):
             chunk = ids_list[i : i + chunk_size]
@@ -424,143 +523,139 @@ class VectorSearchIndex:
             all_rows.extend(cursor.fetchall())
         return all_rows
 
+    def _build_field_predicate(self, field: str, value: Any) -> tuple[str | None, list]:
+        """Build a WHERE fragment for one field, WITHOUT the ``id IN (...)`` anchor.
+
+        Returns ``(fragment, params)`` where ``fragment`` is one of:
+          - ``(None, [])``   -> matches nothing (e.g. an empty list value); the
+            caller should short-circuit to an empty result.
+          - ``("", [])``     -> no constraint on this field (skip it).
+          - ``("<sql>", params)`` -> e.g. ``('"category" = ?', ['x'])``.
+        """
+        if field in self.keyword_fields:
+            if value is None:
+                return (f'"{field}" IS NULL', [])
+            if isinstance(value, (list, tuple, set)):
+                # Multi-value membership: field matches ANY of these values.
+                values = list(value)
+                if not values:
+                    # Empty list matches nothing.
+                    return (None, [])
+                ph = ", ".join("?" for _ in values)
+                return (f'"{field}" IN ({ph})', values)
+            return (f'"{field}" = ?', [value])
+
+        if field in self.numeric_fields:
+            return self._build_typed_predicate(field, value, convert_date=False)
+
+        if field in self.date_fields:
+            return self._build_typed_predicate(field, value, convert_date=True)
+
+        # Unknown field: ignore (same as the legacy per-field loop).
+        return ("", [])
+
+    def _build_typed_predicate(
+        self, field: str, value: Any, *, convert_date: bool
+    ) -> tuple[str | None, list]:
+        """Build a WHERE fragment for a numeric/date field.
+
+        ``convert_date`` converts ``date``/``datetime`` values to ISO strings
+        (date columns are stored as TEXT). Mirrors the legacy numeric/date
+        filter behaviour exactly.
+        """
+        if value is None:
+            return (f'"{field}" IS NULL', [])
+        if is_range_filter(value):
+            conds: list[str] = []
+            params: list = []
+            for op, op_value in value:
+                if op in OPERATORS and op_value is not None:
+                    if convert_date and isinstance(op_value, (date, datetime)):
+                        op_value = op_value.isoformat()
+                    conds.append(f'"{field}" {op} ?')
+                    params.append(op_value)
+            if not conds:
+                return ("", [])  # no usable condition -> no constraint
+            return (" AND ".join(conds), params)
+        # scalar equality
+        if convert_date and isinstance(value, (date, datetime)):
+            value = value.isoformat()
+        return (f'"{field}" = ?', [value])
+
+    def _build_filter_where(self, filter_dict: dict[str, Any]) -> tuple[str | None, list]:
+        """Compose the full WHERE clause for a ``filter_dict`` (AND-combined).
+
+        Like :meth:`_build_field_predicate`, returns ``(None, [])`` when the
+        filter provably matches nothing, ``("", [])`` for no constraint, or a
+        ready ``("<sql>", params)`` fragment. No ``id IN (...)`` anchor.
+        """
+        fragments: list[str] = []
+        params: list = []
+        for field, value in filter_dict.items():
+            frag, field_params = self._build_field_predicate(field, value)
+            if frag is None:
+                return (None, [])  # matches nothing
+            if frag:
+                fragments.append(frag)
+                params.extend(field_params)
+        if not fragments:
+            return ("", [])
+        return (" AND ".join(fragments), params)
+
+    def _filtered_vector_where(self, fragment: str | None, params: list) -> tuple[str | None, list]:
+        """Scope a filter fragment to vector-bearing rows.
+
+        Adds ``vector_hash IS NOT NULL`` so text-only rows from a shared
+        (hybrid) ``docs`` table are excluded (#2). ``fragment=None`` (matches
+        nothing) is passed through as a sentinel.
+        """
+        if fragment is None:
+            return (None, [])
+        if not fragment:
+            return ("vector_hash IS NOT NULL", params)
+        return (f"{fragment} AND vector_hash IS NOT NULL", params)
+
+    def _count_filtered(self, cursor: sqlite3.Cursor, filter_dict: dict[str, Any]) -> int:
+        """Count vector rows matching ``filter_dict`` (no candidate anchor)."""
+        where, params = self._filtered_vector_where(*self._build_filter_where(filter_dict))
+        if where is None:
+            return 0
+        cursor.execute(f"SELECT COUNT(*) AS c FROM docs WHERE {where}", params)
+        return cursor.fetchone()["c"]
+
+    def _enumerate_filtered_ids(
+        self, cursor: sqlite3.Cursor, filter_dict: dict[str, Any]
+    ) -> set[int]:
+        """Return all vector-row ids matching ``filter_dict`` (no candidate anchor)."""
+        where, params = self._filtered_vector_where(*self._build_filter_where(filter_dict))
+        if where is None:
+            return set()
+        cursor.execute(f"SELECT id FROM docs WHERE {where}", params)
+        return {row["id"] for row in cursor.fetchall()}
+
     def _apply_filters(
         self,
         cursor: sqlite3.Cursor,
         candidate_ids: set[int],
         filter_dict: dict[str, Any],
     ) -> set[int]:
-        if not filter_dict:
+        """Intersect ``candidate_ids`` with the docs matching ``filter_dict``."""
+        if not filter_dict or not candidate_ids:
             return candidate_ids
 
-        filtered_ids = candidate_ids.copy()
+        fragment, params = self._build_filter_where(filter_dict)
+        if fragment is None:
+            return set()  # empty-list value matches nothing
+
         ids_list = list(candidate_ids)
-
-        for field, value in filter_dict.items():
-            if field in self.keyword_fields:
-                if value is None:
-                    rows = self._chunked_in_query(
-                        cursor,
-                        f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" IS NULL',
-                        ids_list,
-                    )
-                    valid_ids = set(row["id"] for row in rows)
-                elif isinstance(value, (list, tuple, set)):
-                    # Multi-value membership: field matches ANY of these values.
-                    values = list(value)
-                    if not values:
-                        # Empty list matches nothing.
-                        valid_ids = set()
-                    else:
-                        ph = ", ".join("?" for _ in values)
-                        rows = self._chunked_in_query(
-                            cursor,
-                            f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" IN ({ph})',
-                            ids_list,
-                            values,
-                        )
-                        valid_ids = set(row["id"] for row in rows)
-                else:
-                    rows = self._chunked_in_query(
-                        cursor,
-                        f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" = ?',
-                        ids_list,
-                        [value],
-                    )
-                    valid_ids = set(row["id"] for row in rows)
-                filtered_ids &= valid_ids
-            elif field in self.numeric_fields:
-                filtered_ids = self._apply_numeric_filter(cursor, field, value, filtered_ids)
-            elif field in self.date_fields:
-                filtered_ids = self._apply_date_filter(cursor, field, value, filtered_ids)
-
-        return filtered_ids
-
-    def _apply_numeric_filter(self, cursor, field, value, candidate_ids):
-        if not candidate_ids:
-            return candidate_ids
-        ids_list = list(candidate_ids)
-
-        if value is None:
-            rows = self._chunked_in_query(
-                cursor,
-                f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" IS NULL',
-                ids_list,
-            )
-        elif is_range_filter(value):
-            where_conditions = []
-            extra_params = []
-            for op, op_value in value:
-                if op in OPERATORS and op_value is not None:
-                    where_conditions.append(f'"{field}" {op} ?')
-                    extra_params.append(op_value)
-            if where_conditions:
-                where_sql = " AND " + " AND ".join(where_conditions)
-                rows = self._chunked_in_query(
-                    cursor,
-                    f"SELECT id FROM docs WHERE id IN ({{placeholders}}){where_sql}",
-                    ids_list,
-                    extra_params,
-                )
-            else:
-                rows = self._chunked_in_query(
-                    cursor,
-                    "SELECT id FROM docs WHERE id IN ({placeholders})",
-                    ids_list,
-                )
+        if fragment:
+            sql = f"SELECT id FROM docs WHERE id IN ({{placeholders}}) AND {fragment}"
+            extra_params = params
         else:
-            rows = self._chunked_in_query(
-                cursor,
-                f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" = ?',
-                ids_list,
-                [value],
-            )
-        return set(row["id"] for row in rows) & candidate_ids
-
-    def _apply_date_filter(self, cursor, field, value, candidate_ids):
-        if not candidate_ids:
-            return candidate_ids
-        ids_list = list(candidate_ids)
-
-        if value is None:
-            rows = self._chunked_in_query(
-                cursor,
-                f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" IS NULL',
-                ids_list,
-            )
-        elif is_range_filter(value):
-            where_conditions = []
+            sql = "SELECT id FROM docs WHERE id IN ({placeholders})"
             extra_params = []
-            for op, op_value in value:
-                if op in OPERATORS and op_value is not None:
-                    if isinstance(op_value, (date, datetime)):
-                        op_value = op_value.isoformat()
-                    where_conditions.append(f'"{field}" {op} ?')
-                    extra_params.append(op_value)
-            if where_conditions:
-                where_sql = " AND " + " AND ".join(where_conditions)
-                rows = self._chunked_in_query(
-                    cursor,
-                    f"SELECT id FROM docs WHERE id IN ({{placeholders}}){where_sql}",
-                    ids_list,
-                    extra_params,
-                )
-            else:
-                rows = self._chunked_in_query(
-                    cursor,
-                    "SELECT id FROM docs WHERE id IN ({placeholders})",
-                    ids_list,
-                )
-        else:
-            if isinstance(value, (date, datetime)):
-                value = value.isoformat()
-            rows = self._chunked_in_query(
-                cursor,
-                f'SELECT id FROM docs WHERE id IN ({{placeholders}}) AND "{field}" = ?',
-                ids_list,
-                [value],
-            )
-        return set(row["id"] for row in rows) & candidate_ids
+        rows = self._chunked_in_query(cursor, sql, ids_list, extra_params=extra_params)
+        return {row["id"] for row in rows}
 
     def _rerank(self, cursor, query_vector, candidate_ids, num_results, output_ids):
         if not candidate_ids:
@@ -634,8 +729,7 @@ class VectorSearchIndex:
         # text index may have written rows with a NULL vector_hash; skip those
         # so a cold load doesn't try to np.frombuffer(None) (issue #2).
         cursor.execute(
-            "SELECT id, doc_json, vector_hash FROM docs "
-            "WHERE vector_hash IS NOT NULL ORDER BY id"
+            "SELECT id, doc_json, vector_hash FROM docs WHERE vector_hash IS NOT NULL ORDER BY id"
         )
         rows = cursor.fetchall()
         if not rows:
