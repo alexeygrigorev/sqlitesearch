@@ -122,8 +122,8 @@ Vector search supports three modes for approximate nearest neighbor search, all 
 | Mode | Best for | How it works |
 |------|----------|--------------|
 | **LSH** (default) | Up to 100K vectors | Random hyperplane projections + bucket lookup |
-| **IVF** | 10K-500K vectors | K-means clustering + nearest-cluster probe |
-| **HNSW** | 10K-1M+ vectors | Hierarchical proximity graph traversal |
+| **IVF** | 10K-100K vectors | K-means clustering + nearest-cluster probe |
+| **HNSW** | 10K-100K vectors | Hierarchical proximity graph traversal |
 
 ### LSH (default)
 
@@ -278,12 +278,16 @@ sqlitesearch is ideal when you want:
 | Use case | Recommendation |
 |----------|---------------|
 | In-memory / experiments | [minsearch](https://github.com/alexeygrigorev/minsearch) (e.g., in notebooks) |
-| Local projects, up to 100K docs | **sqlitesearch** |
-| Production / high traffic / 1M+ | Elasticsearch, Qdrant, Milvus, etc. |
+| Local projects, up to 100K docs/vectors | **sqlitesearch** |
+| Production / high traffic / 1M+ vectors | Elasticsearch, Qdrant, Milvus, etc. |
 
 ## Benchmarks
 
 We benchmarked sqlitesearch on [Simple English Wikipedia (291K articles)](benchmark/WRITEUP.md) for text search and the [Cohere-1M dataset (768d vectors)](benchmark/WRITEUP.md) for vector search.
+
+Vector search is intended for local, memory-resident use up to about 100K
+vectors. Larger corpora should use a dedicated vector database such as Qdrant,
+Milvus, Elasticsearch/OpenSearch, or another disk/page-aware ANN system.
 
 | Type | 1K | 10K | 100K |
 |------|---:|----:|-----:|
@@ -293,8 +297,15 @@ We benchmarked sqlitesearch on [Simple English Wikipedia (291K articles)](benchm
 | Vector search latency | 3ms | 26ms | 181ms |
 | Vector recall@100 | 0.65 | 0.97 | 0.89 |
 
-Vector search uses multi-probe LSH (`n_probe=2`) with in-memory vector cache for reranking. At 100K, recall (0.89) is competitive with cloud vector databases like ElasticCloud (0.90). For higher recall, use `n_tables=16` (0.95 recall). See [benchmark/WRITEUP.md](benchmark/WRITEUP.md) for full results, recall tuning, and VDBBench leaderboard comparison.
+Vector search uses an in-memory vector cache for reranking and ANN search
+structures. At 100K, recall (0.89 with default LSH, higher with tuned HNSW/LSH)
+is competitive for local use. See [benchmark/WRITEUP.md](benchmark/WRITEUP.md)
+for full results and tuning notes.
 
 ## Architecture
 
-Everything lives in a single SQLite database file. Text search uses FTS5 with BM25 ranking. Vector search uses Locality-Sensitive Hashing (LSH) with random projections for fast candidate retrieval, followed by exact cosine similarity reranking via NumPy. No separate server process, no network communication - SQLite runs inside your Python process, reading and writing directly to the file.
+Everything is persisted in a single SQLite database file. Text search uses FTS5
+with BM25 ranking. Vector search stores vectors, payloads, filter columns, and
+ANN metadata in SQLite, then warms in-memory vector/ANN caches for fast local
+search. No separate server process or network service is required, but vector
+search is not an out-of-core SQLite-page ANN engine.

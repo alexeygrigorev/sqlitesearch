@@ -25,16 +25,13 @@ Dataset: [Cohere Wikipedia-22-12 Medium](https://cohere.com/embed) (768d embeddi
 | IVF | 16 probes | 0.922 | 0.860 | 28.6ms | 35 | 39s | 399 MB |
 | LSH | n_probe=2 | 0.950 | 0.890 | 181ms | 6 | 9s | 466 MB |
 
-## Vector Search at 1M
+## Vector Search Above 100K
 
-| Mode | Config | R@10 | R@100 | Latency | QPS | Build | DB |
-|------|--------|-----:|------:|--------:|----:|------:|---:|
-| HNSW | ef_s=300 | 0.907 | 0.891 | **6.3ms** | **158** | 639s | 4,099 MB |
-| HNSW | ef_s=1000 | 0.953 | 0.945 | 28.1ms | 36 | 639s | 4,099 MB |
-| IVF | 16 probes | **0.944** | **0.923** | 219ms | 4.6 | **368s** | 3,974 MB |
-| LSH | 64t/8b | 0.950 | 0.810 | 3,993ms | 0.3 | 567s | 8,300 MB |
-
-HNSW is best for low-latency search (6ms, 158 QPS). IVF has the fastest build (6 min) and highest recall at default settings. LSH is impractical at 1M.
+Vector search is optimized and recommended for local, memory-resident indexes up
+to about 100K vectors. Larger corpora should use a dedicated vector database or
+a disk/page-aware ANN index. Historical 1M experiments are kept in
+[WRITEUP.md](WRITEUP.md) for context, but 1M is not an advertised target for
+sqlitesearch.
 
 For detailed analysis, parameter tuning, and optimization notes, see **[WRITEUP.md](WRITEUP.md)**.
 
@@ -55,14 +52,14 @@ For detailed analysis, parameter tuning, and optimization notes, see **[WRITEUP.
 
 ### Vector search
 
-Vector benchmarks require the Cohere-1M dataset at `/data/vectordb_bench/dataset/cohere_medium_1m/` (override with the `SQLITESEARCH_BENCH_DATA` env var). See [WRITEUP.md](WRITEUP.md) for download details.
+Vector benchmarks use subsets of the Cohere-1M dataset at
+`/data/vectordb_bench/dataset/cohere_medium_1m/` (override with the
+`SQLITESEARCH_BENCH_DATA` env var). The recommended benchmark target is 100K
+vectors. See [WRITEUP.md](WRITEUP.md) for download details.
 
 ```bash
 # Compare all vector search modes at 100K
 uv run python benchmark/bench_modes.py --n-vectors 100000
-
-# Compare modes at 1M
-uv run python benchmark/bench_modes.py --n-vectors 1000000
 
 # Only HNSW configs
 uv run python benchmark/bench_modes.py --n-vectors 100000 --modes hnsw
@@ -71,7 +68,7 @@ uv run python benchmark/bench_modes.py --n-vectors 100000 --modes hnsw
 uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 100000
 
 # HNSW recall/latency sweep (builds once, tests multiple ef_search)
-uv run python benchmark/tune_hnsw_search.py --n-vectors 1000000 --ef-search 200 300 500 1000
+uv run python benchmark/tune_hnsw_search.py --n-vectors 100000 --ef-search 200 300 500
 
 # LSH parameter tuning
 uv run python benchmark/tune_recall.py --n-vectors 100000
@@ -91,13 +88,8 @@ Commands:
 # 30K, all modes
 uv run python benchmark/profile_filtered_search.py --n-vectors 30000 --n-queries 20
 
-# 100K / 300K, HNSW only
+# 100K, HNSW only
 uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 100000 --n-queries 20
-uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 300000 --n-queries 20
-
-# 1M, HNSW fast-build shape used by the earlier 1M benchmark
-uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 1000000 \
-  --n-queries 20 --hnsw-ef-construction 16 --hnsw-ef-search 300
 ```
 
 Local results measured during the filtered-search optimization pass:
@@ -108,17 +100,13 @@ Local results measured during the filtered-search optimization pass:
 | 30K | IVF 8 probes | 10.7s | 11.7ms | 32.3ms | find 1.5ms, rerank 9.8ms |
 | 30K | HNSW ef300/efc64 | 66.0s | 8.0ms | 8.8ms | find 7.4ms, rerank 0.5ms |
 | 100K | HNSW ef300/efc64 | 232.5s | 6.3ms | 7.3ms | find 5.8ms, rerank 0.4ms |
-| 300K | HNSW ef300/efc64 | 720.8s | 12.8ms | 18.7ms | find 12.0ms, rerank 0.7ms |
-| 1M | HNSW ef300/efc16 | 900.6s | 579.5ms | 966.6ms | find 577.9ms, rerank 1.4ms |
 
 Interpretation:
 - Filter enumeration is no longer the bottleneck (`enum` is ~0ms after the
   first cached filter compile).
-- 100K broad-filter HNSW now matches the historical unfiltered latency range
-  (~6ms).
-- 1M HNSW does **not** match the earlier documented ~6ms unfiltered search
-  result in this run. The slowdown is inside raw HNSW candidate search, not
-  filter planning or reranking, and needs a separate HNSW-scale follow-up.
+- 100K broad-filter HNSW is in the same low-millisecond range as unfiltered
+  HNSW.
+- Larger vector corpora are not a recommended target for this project.
 
 ### Text search
 

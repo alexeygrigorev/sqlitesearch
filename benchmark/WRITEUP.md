@@ -11,9 +11,11 @@ sqlitesearch is designed for small, local projects — no servers, no dependenci
 | Vector search | up to 100K | HNSW | Best — 0.94 recall, 5.5ms, 181 QPS |
 | Vector search | up to 100K | IVF | Good — 0.86 recall, 29ms, 35 QPS |
 | Vector search | up to 100K | LSH | OK — 0.89 recall with n_probe=2, 181ms |
-| Vector search | 1M | HNSW | Best — 0.89 recall, 6ms, 158 QPS, 10.5 min build |
-| Vector search | 1M | IVF | Good — 0.92 recall@100, 219ms, 6 min build |
-| Vector search | 1M | LSH | Too slow — max 0.82 recall at 4s latency |
+
+Vector search is intentionally positioned for local, memory-resident indexes up
+to about 100K vectors. Historical 1M experiments are kept below for context,
+but 1M+ vector corpora should use a dedicated vector database or a disk/page-aware
+ANN system.
 
 ---
 
@@ -82,7 +84,7 @@ Cohere Wikipedia-22-12 Medium (1M) — 768-dimensional embeddings of English Wik
 
 At 100K, HNSW dominates: highest recall with lowest latency. IVF offers a good balance with fast builds. LSH has the fastest build but slowest search.
 
-### Results at 1M
+### Historical 1M experiments (not recommended)
 
 | Mode | Config | R@10 | R@100 | Latency | QPS | Build | DB |
 |------|--------|-----:|------:|--------:|----:|------:|---:|
@@ -92,11 +94,15 @@ At 100K, HNSW dominates: highest recall with lowest latency. IVF offers a good b
 | IVF | 8 probes | 0.889 | 0.851 | 124ms | 8.1 | 369s | 3,974 MB |
 | LSH | 64t/8b | 0.950 | 0.810 | 3,993ms | 0.3 | 567s | 8,300 MB |
 
-HNSW is best for low-latency search: 0.89 recall at 6ms (158 QPS), 35x faster than IVF. With ef_search=1000, HNSW reaches 0.95 recall at 28ms (still 8x faster than IVF). IVF has the fastest build (6 min vs 10.5 min). LSH is impractical at this scale.
+These results are historical benchmark data, not an advertised support target.
+The current recommendation is to stop at about 100K vectors and use a dedicated
+vector database for 1M+ corpora.
 
-### VDBBench leaderboard comparison (Cohere-1M)
+### Historical VDBBench context (Cohere-1M)
 
-Leaderboard data from [VDBBench](https://zilliz.com/vdbbench-leaderboard) at $1,000/month cost tier.
+Leaderboard data from [VDBBench](https://zilliz.com/vdbbench-leaderboard) at
+$1,000/month cost tier. This comparison is retained for context only; 1M vector
+search is no longer the positioning for sqlitesearch.
 
 | Database | QPS | P99 (ms) | Recall@100 |
 |----------|----:|--------:|-----------:|
@@ -138,7 +144,7 @@ Build optimization: reverse edges use an overflow buffer that is periodically pr
 | m16/ef_c64/ef_s200 | 0.928 | 0.917 | 3.9ms | 4.3ms | 260 | 161s | 547 MB |
 | m16/ef_c64/ef_s300 | 0.939 | 0.937 | 5.5ms | 6.0ms | 181 | 161s | 547 MB |
 
-### HNSW tuning at 1M (Cohere 768d, m=20, ef_construction=16)
+### Historical HNSW tuning at 1M (not recommended)
 
 | ef_search | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
 |-----------|------|-------|-------------|-------------|-----|-------|---------|
@@ -147,16 +153,18 @@ Build optimization: reverse edges use an overflow buffer that is periodically pr
 | 500 | 0.920 | 0.916 | 10.4ms | 13.4ms | 96 | 639s | 4,099 MB |
 | 1000 | 0.953 | 0.945 | 28.1ms | 75.5ms | 36 | 639s | 4,099 MB |
 
-HNSW excels at search speed with tunable recall. At 100K, the default config achieves 0.94 recall with 5.5ms latency. At 1M, the same build (10.5 min) gives 0.86-0.95 recall depending on ef_search — 40x faster search than IVF at the same recall.
+HNSW excels at search speed with tunable recall at 100K, where the default
+config achieves 0.94 recall with 5.5ms latency. The 1M table is retained as a
+historical experiment only; 1M is no longer recommended for sqlitesearch.
 
 ```python
-# HNSW default (good balance, works well up to 1M)
+# HNSW default (good balance for local 100K-scale vector search)
 index = VectorSearchIndex(mode="hnsw", db_path="vectors.db")
 
-# Higher recall (0.95 at 1M, 28ms latency)
+# Higher recall at the cost of slower search
 index = VectorSearchIndex(mode="hnsw", ef_search=1000, db_path="vectors.db")
 
-# Faster build at 1M (10 min instead of 15 min)
+# Faster build, lower graph quality
 index = VectorSearchIndex(mode="hnsw", ef_construction=16, db_path="vectors.db")
 ```
 
@@ -174,14 +182,15 @@ IVF clusters vectors using k-means, then at query time searches only the nearest
 | IVF 8 probes | 0.866 | 0.746 | 14.8ms | 32.0ms | 68 | 36s | 399 MB |
 | IVF 16 probes | 0.922 | 0.860 | 28.6ms | 56.2ms | 35 | 39s | 399 MB |
 
-### IVF tuning at 1M (Cohere 768d)
+### Historical IVF tuning at 1M (not recommended)
 
 | Config | R@10 | R@100 | Avg latency | P99 latency | QPS | Build | DB size |
 |--------|------|-------|-------------|-------------|-----|-------|---------|
 | IVF 8 probes | 0.889 | 0.851 | 124ms | 175ms | 8.1 | 369s | 3,974 MB |
 | IVF 16 probes | 0.944 | 0.923 | 219ms | 296ms | 4.6 | 368s | 3,974 MB |
 
-IVF has the fastest build at 1M (6 min) and highest recall (0.92), but higher latency than HNSW. The k-means build is fast because it's pure numpy vectorized.
+These IVF results are historical 1M experiments. For current positioning, use a
+dedicated vector database for 1M+ corpora.
 
 ```python
 # IVF with 16 probe clusters (best recall)
@@ -276,9 +285,6 @@ The focused profiler is:
 ```bash
 uv run python benchmark/profile_filtered_search.py --n-vectors 30000 --n-queries 20
 uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 100000 --n-queries 20
-uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 300000 --n-queries 20
-uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 1000000 \
-  --n-queries 20 --hnsw-ef-construction 16 --hnsw-ef-search 300
 ```
 
 Local results measured during this pass for a broad 70% keyword filter
@@ -290,18 +296,11 @@ Local results measured during this pass for a broad 70% keyword filter
 | 30K | IVF 8 probes | 10.7s | 11.7ms | 32.3ms | find 1.5ms, rerank 9.8ms |
 | 30K | HNSW ef300/efc64 | 66.0s | 8.0ms | 8.8ms | find 7.4ms, rerank 0.5ms |
 | 100K | HNSW ef300/efc64 | 232.5s | 6.3ms | 7.3ms | find 5.8ms, rerank 0.4ms |
-| 300K | HNSW ef300/efc64 | 720.8s | 12.8ms | 18.7ms | find 12.0ms, rerank 0.7ms |
-| 1M | HNSW ef300/efc16 | 900.6s | 579.5ms | 966.6ms | find 577.9ms, rerank 1.4ms |
 
 The 30K results show the filter-id cache and cached vector norms remove the
-original broad-filter SQL/rerank overhead. The 100K and 300K HNSW results are
-also in the expected low-millisecond range for broad filters.
-
-The 1M HNSW result does **not** reproduce the earlier documented ~6ms search
-latency. In this profiler run the cost is inside raw HNSW candidate search
-(`find_candidates`), not filter enumeration (`enum` is ~0ms after caching) or
-reranking. Treat this as an open HNSW-scale regression/follow-up rather than a
-filtered-planner issue.
+original broad-filter SQL/rerank overhead. 100K broad-filter HNSW remains in
+the expected low-millisecond range. Larger vector corpora are outside the
+recommended target for sqlitesearch.
 
 ---
 
