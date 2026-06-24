@@ -99,9 +99,12 @@ class VectorSearchIndex:
         # In-memory vector cache for fast reranking
         self._dimension: int | None = None
         self._cached_vectors: np.ndarray | None = None
+        self._cached_vector_norms: np.ndarray | None = None
         self._cached_doc_ids: list[int] | None = None
         self._cached_docs: list[dict] | None = None
         self._id_to_cache_idx: dict[int, int] | None = None
+        self._filter_cache: dict[tuple, dict[str, Any]] = {}
+        self._filter_cache_max_entries = 16
 
         # Add id_field to keyword_fields if provided and not already there
         if self.id_field and self.id_field not in self.keyword_fields:
@@ -345,6 +348,8 @@ class VectorSearchIndex:
         conn.commit()
 
         # Update in-memory vector cache
+        new_norms = np.linalg.norm(vectors, axis=1).astype(np.float32)
+        new_norms = np.where(new_norms == 0, 1.0, new_norms)
         new_docs = []
         for doc_row in doc_rows:
             doc = json.loads(doc_row[0])
@@ -353,17 +358,23 @@ class VectorSearchIndex:
 
         if self._cached_vectors is None:
             self._cached_vectors = vectors.copy()
+            self._cached_vector_norms = new_norms
             self._cached_doc_ids = list(doc_ids)
             self._cached_docs = new_docs
             self._id_to_cache_idx = {did: i for i, did in enumerate(doc_ids)}
         else:
             offset = len(self._cached_doc_ids)
             self._cached_vectors = np.vstack([self._cached_vectors, vectors])
+            self._cached_vector_norms = np.concatenate([
+                self._cached_vector_norms,
+                new_norms,
+            ])
             self._cached_doc_ids.extend(doc_ids)
             self._cached_docs.extend(new_docs)
             for i, did in enumerate(doc_ids):
                 self._id_to_cache_idx[did] = offset + i
 
+        self._filter_cache.clear()
         return self
 
     def clear(self) -> "VectorSearchIndex":
@@ -377,9 +388,11 @@ class VectorSearchIndex:
 
         self._dimension = None
         self._cached_vectors = None
+        self._cached_vector_norms = None
         self._cached_doc_ids = None
         self._cached_docs = None
         self._id_to_cache_idx = None
+        self._filter_cache.clear()
 
         conn.commit()
         return self
@@ -431,8 +444,10 @@ class VectorSearchIndex:
                 return []
             return self._rerank(cursor, query_vector, candidate_ids, num_results, output_ids)
 
-        # Filtered path: cardinality-aware planner.
-        filtered_count = self._count_filtered(cursor, filter_dict)
+        # Filtered path: cardinality-aware planner. Compile the filter once
+        # and reuse the matching id set for exact search or ANN post-filtering.
+        filtered_ids = self._enumerate_filtered_ids(cursor, filter_dict)
+        filtered_count = len(filtered_ids)
         if filtered_count == 0:
             return []
 
@@ -446,19 +461,19 @@ class VectorSearchIndex:
             # Selective filter: exact cosine over the filtered subset. Cheap
             # because vectors are cached in memory and _rerank already does
             # exact cosine over an arbitrary id set.
-            filtered_ids = self._enumerate_filtered_ids(cursor, filter_dict)
-            if not filtered_ids:
-                return []
             return self._rerank(cursor, query_vector, filtered_ids, num_results, output_ids)
 
         # Non-selective filter: ANN candidates -> filter -> adaptive over-fetch.
-        return self._filtered_ann_search(cursor, query_vector, filter_dict, num_results, output_ids)
+        return self._filtered_ann_search(
+            cursor, query_vector, filter_dict, filtered_ids, num_results, output_ids
+        )
 
     def _filtered_ann_search(
         self,
         cursor: sqlite3.Cursor,
         query_vector: np.ndarray,
         filter_dict: dict[str, Any],
+        filtered_ids: set[int],
         num_results: int,
         output_ids: bool,
     ) -> list[dict[str, Any]]:
@@ -479,9 +494,7 @@ class VectorSearchIndex:
         knob, cap = self._ann_budget_knob_and_cap()
 
         if self._mode == VectorMode.HNSW:
-            allowed = self._enumerate_filtered_ids(cursor, filter_dict)
-            if not allowed:
-                return []
+            allowed = self._hnsw_filter_mask(cursor, filter_dict, filtered_ids)
             current = self._strategy.ef_search
             candidates: set[int] = set()
             while True:
@@ -508,7 +521,9 @@ class VectorSearchIndex:
             candidate_ids = self._strategy.find_candidates(
                 cursor, query_vector, override={knob: current}
             )
-            survivors = self._apply_filters(cursor, candidate_ids, filter_dict)
+            survivors = self._apply_filters(
+                cursor, candidate_ids, filter_dict, allowed_ids=filtered_ids
+            )
             if len(survivors) >= num_results or current >= cap:
                 break
             nxt = min(current * 2, cap)
@@ -643,18 +658,81 @@ class VectorSearchIndex:
             return ("vector_hash IS NOT NULL", params)
         return (f"{fragment} AND vector_hash IS NOT NULL", params)
 
+    def _filter_cache_key(self, filter_dict: dict[str, Any]) -> tuple:
+        return tuple(
+            sorted((field, self._freeze_filter_value(value)) for field, value in filter_dict.items())
+        )
+
+    def _freeze_filter_value(self, value: Any) -> Any:
+        if isinstance(value, (date, datetime)):
+            return ("date", value.isoformat())
+        if is_range_filter(value):
+            return (
+                "range",
+                tuple((op, self._freeze_filter_value(op_value)) for op, op_value in value),
+            )
+        if isinstance(value, (list, tuple, set)):
+            frozen = [self._freeze_filter_value(v) for v in value]
+            return ("in", tuple(sorted(frozen, key=repr)))
+        try:
+            hash(value)
+        except TypeError:
+            return ("repr", repr(value))
+        return value
+
+    def _filter_cache_entry(
+        self, cursor: sqlite3.Cursor, filter_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        key = self._filter_cache_key(filter_dict)
+        entry = self._filter_cache.get(key)
+        if entry is not None:
+            return entry
+
+        ids = self._enumerate_filtered_ids_uncached(cursor, filter_dict)
+        entry = {"ids": ids}
+        if len(self._filter_cache) >= self._filter_cache_max_entries:
+            self._filter_cache.pop(next(iter(self._filter_cache)))
+        self._filter_cache[key] = entry
+        return entry
+
+    def _hnsw_filter_mask(
+        self,
+        cursor: sqlite3.Cursor,
+        filter_dict: dict[str, Any],
+        filtered_ids: set[int],
+    ) -> set[int] | np.ndarray:
+        entry = self._filter_cache_entry(cursor, filter_dict)
+        mask = entry.get("hnsw_mask")
+        if mask is not None:
+            return mask
+
+        id_to_idx = getattr(self._strategy, "_id_to_idx", None)
+        n_nodes = getattr(self._strategy, "_n_nodes", 0) or 0
+        if id_to_idx is None or n_nodes <= 0:
+            return filtered_ids
+
+        mask = np.zeros(n_nodes, dtype=bool)
+        for did in filtered_ids:
+            idx = id_to_idx.get(did)
+            if idx is not None:
+                mask[idx] = True
+        entry["hnsw_mask"] = mask
+        return mask
+
     def _count_filtered(self, cursor: sqlite3.Cursor, filter_dict: dict[str, Any]) -> int:
         """Count vector rows matching ``filter_dict`` (no candidate anchor)."""
-        where, params = self._filtered_vector_where(*self._build_filter_where(filter_dict))
-        if where is None:
-            return 0
-        cursor.execute(f"SELECT COUNT(*) AS c FROM docs WHERE {where}", params)
-        return cursor.fetchone()["c"]
+        return len(self._enumerate_filtered_ids(cursor, filter_dict))
 
     def _enumerate_filtered_ids(
         self, cursor: sqlite3.Cursor, filter_dict: dict[str, Any]
     ) -> set[int]:
         """Return all vector-row ids matching ``filter_dict`` (no candidate anchor)."""
+        return self._filter_cache_entry(cursor, filter_dict)["ids"]
+
+    def _enumerate_filtered_ids_uncached(
+        self, cursor: sqlite3.Cursor, filter_dict: dict[str, Any]
+    ) -> set[int]:
+        """Return all vector-row ids matching ``filter_dict`` without cache."""
         where, params = self._filtered_vector_where(*self._build_filter_where(filter_dict))
         if where is None:
             return set()
@@ -666,10 +744,14 @@ class VectorSearchIndex:
         cursor: sqlite3.Cursor,
         candidate_ids: set[int],
         filter_dict: dict[str, Any],
+        allowed_ids: set[int] | None = None,
     ) -> set[int]:
         """Intersect ``candidate_ids`` with the docs matching ``filter_dict``."""
         if not filter_dict or not candidate_ids:
             return candidate_ids
+
+        if allowed_ids is not None:
+            return candidate_ids & allowed_ids
 
         fragment, params = self._build_filter_where(filter_dict)
         if fragment is None:
@@ -698,6 +780,11 @@ class VectorSearchIndex:
 
             cache_indices = np.array(cache_indices)
             candidate_matrix = self._cached_vectors[cache_indices]
+            candidate_norms = (
+                self._cached_vector_norms[cache_indices]
+                if self._cached_vector_norms is not None
+                else None
+            )
         else:
             ids_list = list(candidate_ids)
             rows = self._chunked_in_query(
@@ -714,16 +801,20 @@ class VectorSearchIndex:
             candidate_matrix = np.stack(
                 [np.frombuffer(row["vector_hash"], dtype=np.float32) for row in rows]
             )
+            candidate_norms = None
 
         # Vectorized cosine similarity
         query_norm = np.linalg.norm(query_vector)
-        query_normalized = query_vector if query_norm == 0 else query_vector / query_norm
-
-        norms = np.linalg.norm(candidate_matrix, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        normalized_matrix = candidate_matrix / norms
-
-        similarities = normalized_matrix @ query_normalized
+        if query_norm == 0:
+            similarities = np.zeros(len(candidate_matrix), dtype=np.float32)
+        elif candidate_norms is not None:
+            similarities = (candidate_matrix @ query_vector) / (candidate_norms * query_norm)
+        else:
+            query_normalized = query_vector / query_norm
+            norms = np.linalg.norm(candidate_matrix, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            normalized_matrix = candidate_matrix / norms
+            similarities = normalized_matrix @ query_normalized
 
         if num_results < len(similarities):
             top_indices = np.argpartition(similarities, -num_results)[-num_results:]
@@ -774,6 +865,14 @@ class VectorSearchIndex:
             vectors_list.append(np.frombuffer(row["vector_hash"], dtype=np.float32))
 
         self._cached_vectors = np.stack(vectors_list)
+        self._cached_vector_norms = np.linalg.norm(
+            self._cached_vectors, axis=1
+        ).astype(np.float32)
+        self._cached_vector_norms = np.where(
+            self._cached_vector_norms == 0,
+            1.0,
+            self._cached_vector_norms,
+        )
         self._cached_doc_ids = doc_ids
         self._cached_docs = docs
         self._id_to_cache_idx = {did: i for i, did in enumerate(doc_ids)}

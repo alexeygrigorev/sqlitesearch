@@ -207,16 +207,16 @@ class HNSWStrategy:
         query_vector: np.ndarray,
         *,
         override: dict[str, int] | None = None,
-        filter_ids: set[int] | None = None,
+        filter_ids: set[int] | np.ndarray | None = None,
     ) -> set[int]:
         """Search HNSW graph for nearest neighbors.
 
         ``override["ef_search"]`` temporarily widens the beam for this call
-        only (no mutation of shared state). When ``filter_ids`` is given the
-        layer-0 walk is *filter-aware*: it traverses every neighbor for
-        connectivity but collects only matching nodes, so disqualified subtrees
-        are skipped in a single pass instead of being gathered and then
-        post-filtered out of several widened passes.
+        only (no mutation of shared state). When ``filter_ids`` is given as a
+        doc-id set or node mask, the layer-0 walk is *filter-aware*: it
+        traverses every neighbor for connectivity but collects only matching
+        nodes, so disqualified subtrees are skipped in a single pass instead
+        of being gathered and then post-filtered out of several widened passes.
         """
         if self._entry_point is None:
             return set()
@@ -234,7 +234,10 @@ class HNSWStrategy:
             current = self._greedy_search_upper(query_normed, current, layer, vecs)
 
         valid_mask = None
-        if filter_ids is not None and self._id_to_idx is not None:
+        if isinstance(filter_ids, np.ndarray):
+            if filter_ids.dtype == bool and len(filter_ids) >= self._n_nodes:
+                valid_mask = filter_ids
+        elif filter_ids is not None and self._id_to_idx is not None:
             # Translate the allowed doc_ids into a per-node membership mask.
             valid_mask = np.zeros(self._n_nodes, dtype=bool)
             for did in filter_ids:
