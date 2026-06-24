@@ -55,7 +55,7 @@ For detailed analysis, parameter tuning, and optimization notes, see **[WRITEUP.
 
 ### Vector search
 
-Vector benchmarks require the Cohere-1M dataset at `/tmp/vectordb_bench/dataset/cohere_medium_1m/`. See [WRITEUP.md](WRITEUP.md) for download details.
+Vector benchmarks require the Cohere-1M dataset at `/data/vectordb_bench/dataset/cohere_medium_1m/` (override with the `SQLITESEARCH_BENCH_DATA` env var). See [WRITEUP.md](WRITEUP.md) for download details.
 
 ```bash
 # Compare all vector search modes at 100K

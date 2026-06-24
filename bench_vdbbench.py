@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from sqlitesearch.vector.index import VectorSearchIndex
 
 # --- Configuration ---
-DATASET_DIR = Path("/tmp/vectordb_bench/dataset")
+DATASET_DIR = Path(os.environ.get("SQLITESEARCH_BENCH_DATA", "/data/vectordb_bench/dataset"))
 COHERE_1M_DIR = DATASET_DIR / "cohere_medium_1m"
 S3_BUCKET = "assets.zilliz.com"
 S3_PREFIX = "benchmark/cohere_medium_1m"

@@ -23,7 +23,9 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from sqlitesearch.vector.index import VectorSearchIndex
 
-DATASET_DIR = Path("/tmp/vectordb_bench/dataset/cohere_medium_1m")
+DATASET_DIR = Path(
+    os.environ.get("SQLITESEARCH_BENCH_DATA", "/data/vectordb_bench/dataset/cohere_medium_1m")
+)
 K = 100
 N_QUERIES = 100
 SEED = 42

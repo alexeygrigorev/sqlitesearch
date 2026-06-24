@@ -67,7 +67,7 @@ Cohere Wikipedia-22-12 Medium (1M) — 768-dimensional embeddings of English Wik
   - `s3://assets.zilliz.com/benchmark/cohere_medium_1m/neighbors.parquet` — pre-computed ground truth (top-100 neighbors)
 - Dimensions: 768 (float32)
 - Similarity metric: Cosine
-- Download: The benchmark script expects files at `/tmp/vectordb_bench/dataset/cohere_medium_1m/`. Use the download function in `bench_vdbbench.py` or download manually with [s3fs](https://pypi.org/project/s3fs/) / AWS CLI.
+- Download: The benchmark script expects files at `/data/vectordb_bench/dataset/cohere_medium_1m/` (override with `SQLITESEARCH_BENCH_DATA`). Use the download function in `bench_vdbbench.py` or download manually with [s3fs](https://pypi.org/project/s3fs/) / AWS CLI.
 
 ### Results at 100K
 
