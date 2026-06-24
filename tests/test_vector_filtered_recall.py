@@ -244,3 +244,87 @@ class TestAdaptiveOverFetch:
 
         # The transient ef_search widening must not leak to later queries.
         assert index._strategy.ef_search == 8
+
+
+# --- Phase 2: HNSW node-skipping traversal ---------------------------------
+
+
+class TestFilteredHNSWNodeSkipping:
+    """The HNSW filter-aware (node-skipping) traversal walks the graph through
+    non-matching nodes but collects only matching ones. With the exact branch
+    disabled this path alone must still return the true top-k within the
+    filter."""
+
+    def test_nodeskipping_recall_forced_ann(self, temp_db):
+        rng = np.random.default_rng(42)
+        n, dim = 2000, 64
+        vectors = rng.standard_normal((n, dim)).astype(np.float32)
+        payload = [{"id": i, "course": f"c{i % 10}"} for i in range(n)]
+
+        index = VectorSearchIndex(
+            mode="hnsw",
+            m=16,
+            ef_construction=100,
+            ef_search=64,
+            exact_filter_threshold=0,  # force filtered-ANN -> node-skipping
+            keyword_fields=["course"],
+            db_path=temp_db,
+        )
+        index.fit(vectors, payload)
+
+        recalls = []
+        for qi in range(0, n, 53):
+            course = payload[qi]["course"]
+            recalls.append(_recall(index, vectors[qi], {"course": course}, vectors, payload, 10))
+        mean_recall = float(np.mean(recalls))
+        assert mean_recall >= 0.9, f"node-skipping recall@10 = {mean_recall:.3f}"
+
+    def test_non_matching_entry_point_still_finds_matches(self, temp_db):
+        """If the entry point itself fails the filter, the walk must still
+        expand its neighbors and reach the allowed region (results must be
+        non-empty and all-matching)."""
+        rng = np.random.default_rng(1)
+        n, dim = 500, 48
+        vectors = rng.standard_normal((n, dim)).astype(np.float32)
+        payload = [{"id": i, "course": f"c{i % 5}"} for i in range(n)]
+
+        index = VectorSearchIndex(
+            mode="hnsw",
+            m=16,
+            ef_construction=100,
+            ef_search=32,
+            exact_filter_threshold=0,
+            keyword_fields=["course"],
+            db_path=temp_db,
+        )
+        index.fit(vectors, payload)
+
+        # Query for a course that the nearest vector (vectors[0]) does NOT have,
+        # so the entry neighbourhood is dominated by non-matching nodes.
+        target_course = "c2"
+        results = index.search(vectors[0], filter_dict={"course": target_course}, num_results=10)
+        assert len(results) == 10
+        assert all(r["course"] == target_course for r in results)
+
+
+class TestNoStrategyMutation:
+    """The ``override`` kwarg widens the budget per-call only. The shared
+    strategy object must be untouched after a filtered search that runs the
+    over-fetch loop (strategies are shared across threads; connections are
+    thread-local)."""
+
+    @pytest.mark.parametrize(
+        "mode,knob",
+        [("hnsw", "ef_search"), ("ivf", "n_probe_clusters"), ("lsh", "n_probe")],
+    )
+    def test_budget_attr_unchanged_after_filtered_search(self, mode, knob, temp_db):
+        index, vectors, payload = _build_course_index(mode, temp_db, n=600, dim=32)
+        original = getattr(index._strategy, knob)
+        index._exact_filter_threshold = 0  # force the over-fetch loop
+        results = index.search(
+            vectors[0],
+            filter_dict={"course": payload[0]["course"]},
+            num_results=10,
+        )
+        assert all(r["course"] == payload[0]["course"] for r in results)
+        assert getattr(index._strategy, knob) == original

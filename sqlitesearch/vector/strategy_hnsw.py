@@ -201,8 +201,23 @@ class HNSWStrategy:
         self._save_graph(cursor, self._doc_ids)
         self.save_params(cursor)
 
-    def find_candidates(self, cursor: sqlite3.Cursor, query_vector: np.ndarray) -> set[int]:
-        """Search HNSW graph for nearest neighbors."""
+    def find_candidates(
+        self,
+        cursor: sqlite3.Cursor,
+        query_vector: np.ndarray,
+        *,
+        override: dict[str, int] | None = None,
+        filter_ids: set[int] | None = None,
+    ) -> set[int]:
+        """Search HNSW graph for nearest neighbors.
+
+        ``override["ef_search"]`` temporarily widens the beam for this call
+        only (no mutation of shared state). When ``filter_ids`` is given the
+        layer-0 walk is *filter-aware*: it traverses every neighbor for
+        connectivity but collects only matching nodes, so disqualified subtrees
+        are skipped in a single pass instead of being gathered and then
+        post-filtered out of several widened passes.
+        """
         if self._entry_point is None:
             return set()
 
@@ -212,11 +227,24 @@ class HNSWStrategy:
         query_normed = query_vector / (np.linalg.norm(query_vector) + 1e-10)
         vecs = self._vectors
 
+        ef = override["ef_search"] if override and "ef_search" in override else self.ef_search
+
         current = self._entry_point
         for layer in range(self._max_layer, 0, -1):
             current = self._greedy_search_upper(query_normed, current, layer, vecs)
 
-        results = self._beam_search_0(query_normed, current, self.ef_search, vecs)
+        valid_mask = None
+        if filter_ids is not None and self._id_to_idx is not None:
+            # Translate the allowed doc_ids into a per-node membership mask.
+            valid_mask = np.zeros(self._n_nodes, dtype=bool)
+            for did in filter_ids:
+                idx = self._id_to_idx.get(did)
+                if idx is not None:
+                    valid_mask[idx] = True
+
+        results = self._beam_search_0(
+            query_normed, current, ef, vecs, valid_mask=valid_mask
+        )
 
         return {self._doc_ids[idx] for _, idx in results}
 
@@ -719,9 +747,24 @@ class HNSWStrategy:
         return results
 
     def _beam_search_0(
-        self, q_vec: np.ndarray, entry: int, ef: int, vecs: np.ndarray
+        self,
+        q_vec: np.ndarray,
+        entry: int,
+        ef: int,
+        vecs: np.ndarray,
+        *,
+        valid_mask: np.ndarray | None = None,
     ) -> list[tuple[float, int]]:
-        """Beam search on layer 0 using numpy arrays for speed."""
+        """Beam search on layer 0 using numpy arrays for speed.
+
+        When ``valid_mask`` is given the walk is filter-aware: every neighbor
+        is pushed onto the traversal heap so connectivity is preserved across
+        non-matching nodes (the walk can pass through them toward matching
+        ones), but only nodes with ``valid_mask[idx]`` set are collected into
+        the result set. Until ``ef`` matches are gathered no ``worst_sim``
+        pruning is applied, so the frontier keeps expanding toward the allowed
+        region; once ``ef`` matches exist the standard termination resumes.
+        """
         n = self._n_nodes
         adj = self._adj
         adj_count = self._adj_count
@@ -731,14 +774,18 @@ class HNSWStrategy:
         visited[entry] = True
 
         candidates = [(-entry_sim, entry)]
-        results = [(entry_sim, entry)]
-        worst_sim = entry_sim
+        if valid_mask is None or valid_mask[entry]:
+            results = [(entry_sim, entry)]
+            worst_sim = entry_sim
+        else:
+            results = []
+            worst_sim = -np.inf
 
         while candidates:
             neg_sim, current = heapq.heappop(candidates)
             current_sim = -neg_sim
 
-            if current_sim < worst_sim and len(results) >= ef:
+            if results and current_sim < worst_sim and len(results) >= ef:
                 break
 
             count = adj_count[current]
@@ -758,7 +805,8 @@ class HNSWStrategy:
             # Batch similarity
             sims = vecs[new_nbrs] @ q_vec
 
-            # Only process candidates better than worst
+            # Only process candidates better than worst. While we still have
+            # fewer than `ef` results, explore everything; once full, prune.
             if len(results) >= ef:
                 good = sims > worst_sim
                 good_idx = np.where(good)[0]
@@ -768,11 +816,14 @@ class HNSWStrategy:
             for i in good_idx:
                 sim_f = float(sims[i])
                 nbr = int(new_nbrs[i])
+                # Always expand traversal so the walk can bridge through
+                # non-matching nodes toward matching ones.
                 heapq.heappush(candidates, (-sim_f, nbr))
-                heapq.heappush(results, (sim_f, nbr))
-                if len(results) > ef:
-                    heapq.heappop(results)
-                worst_sim = results[0][0]
+                if valid_mask is None or valid_mask[nbr]:
+                    heapq.heappush(results, (sim_f, nbr))
+                    if len(results) > ef:
+                        heapq.heappop(results)
+                    worst_sim = results[0][0]
 
         results.sort(reverse=True)
         return results

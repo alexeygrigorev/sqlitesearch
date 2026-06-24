@@ -84,12 +84,20 @@ class LSHStrategy:
         # Same as build_index for LSH
         self.build_index(cursor, vectors, doc_ids)
 
-    def find_candidates(self, cursor: sqlite3.Cursor, query_vector: np.ndarray) -> set[int]:
+    def find_candidates(
+        self,
+        cursor: sqlite3.Cursor,
+        query_vector: np.ndarray,
+        *,
+        override: dict[str, int] | None = None,
+        filter_ids: set[int] | None = None,  # noqa: ARG002 — LSH has no graph to skip within
+    ) -> set[int]:
+        n_probe = override["n_probe"] if override and "n_probe" in override else self.n_probe
         hash_keys = self._hash_vector_all_tables(query_vector)
 
         hit_counts: dict[int, int] = {}
         for table_id, exact_key in enumerate(hash_keys):
-            probe_keys = self._generate_probe_keys(exact_key, self.n_probe)
+            probe_keys = self._generate_probe_keys(exact_key, n_probe)
             placeholders = ",".join("?" * len(probe_keys))
             cursor.execute(
                 f"SELECT doc_id FROM lsh_buckets "

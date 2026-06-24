@@ -38,8 +38,24 @@ class SearchStrategy(Protocol):
         """Add vectors to the existing index (called during add)."""
         ...
 
-    def find_candidates(self, cursor: sqlite3.Cursor, query_vector: np.ndarray) -> set[int]:
-        """Find candidate document IDs for a query vector."""
+    def find_candidates(
+        self,
+        cursor: sqlite3.Cursor,
+        query_vector: np.ndarray,
+        *,
+        override: dict[str, int] | None = None,
+        filter_ids: set[int] | None = None,
+    ) -> set[int]:
+        """Find candidate document IDs for a query vector.
+
+        ``override`` temporarily replaces strategy parameters (``ef_search``,
+        ``n_probe_clusters``, ``n_probe``) for this call only — used by the
+        filtered-ANN branch to widen the candidate budget without mutating the
+        shared strategy object (strategies are shared across threads).
+        ``filter_ids`` restricts results to an allowed id set; the HNSW strategy
+        honors it graph-aware (skipping non-matching subtrees in a single
+        walk), while LSH/IVF have no graph and ignore it (they post-filter).
+        """
         ...
 
     def clear_index(self, cursor: sqlite3.Cursor) -> None:

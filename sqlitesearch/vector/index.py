@@ -462,34 +462,62 @@ class VectorSearchIndex:
         num_results: int,
         output_ids: bool,
     ) -> list[dict[str, Any]]:
-        """ANN search widened until the post-filter result set is large enough.
+        """Filtered ANN search widened until the result set is large enough.
 
         Mirrors Milvus "iterative filter" / pgvector "iterative index scans": if
-        the post-filter survivors are fewer than ``num_results``, bump the
-        strategy's candidate budget and retry. The budget is restored in a
-        ``finally`` so a transient widening can't leak across searches (the
-        strategy object is shared across threads; connections are thread-local).
+        the survivors are fewer than ``num_results``, bump the candidate budget
+        and retry. The widened budget is passed via the ``override`` kwarg rather
+        than mutating the shared strategy object, so it never leaks across
+        concurrent searches (the strategy is shared across threads; connections
+        are thread-local).
+
+        HNSW uses node-skipping traversal (Phase 2): the allowed id set is
+        enumerated once and pushed into the graph walk, so disqualified subtrees
+        are skipped in a single pass instead of post-filtering many passes.
+        LSH/IVF have no graph, so they gather candidates and post-filter.
         """
         knob, cap = self._ann_budget_knob_and_cap()
-        original = getattr(self._strategy, knob)
-        current = original
-        try:
-            survivors: set[int] = set()
+
+        if self._mode == VectorMode.HNSW:
+            allowed = self._enumerate_filtered_ids(cursor, filter_dict)
+            if not allowed:
+                return []
+            current = self._strategy.ef_search
+            candidates: set[int] = set()
             while True:
-                setattr(self._strategy, knob, current)
-                candidate_ids = self._strategy.find_candidates(cursor, query_vector)
-                survivors = self._apply_filters(cursor, candidate_ids, filter_dict)
-                if len(survivors) >= num_results or current >= cap:
+                candidates = self._strategy.find_candidates(
+                    cursor,
+                    query_vector,
+                    override={knob: current},
+                    filter_ids=allowed,
+                )
+                if len(candidates) >= num_results or current >= cap:
                     break
                 nxt = min(current * 2, cap)
                 if nxt <= current:
                     break  # can't widen further
                 current = nxt
-            if not survivors:
+            if not candidates:
                 return []
-            return self._rerank(cursor, query_vector, survivors, num_results, output_ids)
-        finally:
-            setattr(self._strategy, knob, original)
+            return self._rerank(cursor, query_vector, candidates, num_results, output_ids)
+
+        # LSH / IVF: widen the budget via override, then post-filter.
+        current = getattr(self._strategy, knob)
+        survivors: set[int] = set()
+        while True:
+            candidate_ids = self._strategy.find_candidates(
+                cursor, query_vector, override={knob: current}
+            )
+            survivors = self._apply_filters(cursor, candidate_ids, filter_dict)
+            if len(survivors) >= num_results or current >= cap:
+                break
+            nxt = min(current * 2, cap)
+            if nxt <= current:
+                break  # can't widen further
+            current = nxt
+        if not survivors:
+            return []
+        return self._rerank(cursor, query_vector, survivors, num_results, output_ids)
 
     def _ann_budget_knob_and_cap(self) -> tuple[str, int]:
         """Return (strategy attribute to widen, max useful value) by mode."""

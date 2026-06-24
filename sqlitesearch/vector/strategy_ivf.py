@@ -123,16 +123,33 @@ class IVFStrategy:
             max_vars=getattr(self, "_max_vars", _MAX_SQL_VARS),
         )
 
-    def find_candidates(self, cursor: sqlite3.Cursor, query_vector: np.ndarray) -> set[int]:
-        """Find candidates by probing nearest clusters."""
+    def find_candidates(
+        self,
+        cursor: sqlite3.Cursor,
+        query_vector: np.ndarray,
+        *,
+        override: dict[str, int] | None = None,
+        filter_ids: set[int] | None = None,  # noqa: ARG002 — IVF has no graph to skip within
+    ) -> set[int]:
+        """Find candidates by probing nearest clusters.
+
+        ``override["n_probe_clusters"]`` temporarily widens how many clusters
+        are probed; ``filter_ids`` is ignored (IVF has no graph to skip within).
+        """
         if self._centroids is None:
             return set()
+
+        n_probe_param = (
+            override["n_probe_clusters"]
+            if override and "n_probe_clusters" in override
+            else self.n_probe_clusters
+        )
 
         query_normed = query_vector / (np.linalg.norm(query_vector) + 1e-10)
 
         # Cosine similarity to all centroids
         sims = self._centroids @ query_normed
-        n_probe = min(self.n_probe_clusters, len(self._centroids))
+        n_probe = min(n_probe_param, len(self._centroids))
         top_clusters = np.argsort(sims)[-n_probe:][::-1]
 
         # Fetch doc_ids from those clusters
