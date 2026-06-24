@@ -67,12 +67,58 @@ uv run python benchmark/bench_modes.py --n-vectors 1000000
 # Only HNSW configs
 uv run python benchmark/bench_modes.py --n-vectors 100000 --modes hnsw
 
+# Instrument filtered search hot paths
+uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 100000
+
 # HNSW recall/latency sweep (builds once, tests multiple ef_search)
 uv run python benchmark/tune_hnsw_search.py --n-vectors 1000000 --ef-search 200 300 500 1000
 
 # LSH parameter tuning
 uv run python benchmark/tune_recall.py --n-vectors 100000
 ```
+
+### Filtered vector search profile
+
+`profile_filtered_search.py` is a focused profiler for repeated filtered vector
+queries. It instruments filter enumeration, ANN candidate search, SQL/post-filter
+intersection, and reranking. The default filter is broad (`category IN c0..c6`,
+70% of the corpus), so it exercises the filtered-ANN branch rather than the
+exact filtered branch.
+
+Commands:
+
+```bash
+# 30K, all modes
+uv run python benchmark/profile_filtered_search.py --n-vectors 30000 --n-queries 20
+
+# 100K / 300K, HNSW only
+uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 100000 --n-queries 20
+uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 300000 --n-queries 20
+
+# 1M, HNSW fast-build shape used by the earlier 1M benchmark
+uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 1000000 \
+  --n-queries 20 --hnsw-ef-construction 16 --hnsw-ef-search 300
+```
+
+Local results measured during the filtered-search optimization pass:
+
+| N vectors | mode/config | build | broad filter avg | p99 | profiler breakdown |
+|--:|---|--:|--:|--:|---|
+| 30K | LSH 8t/16b/p2 | 4.6s | 71.9ms | 102.7ms | find 44.3ms, rerank 25.7ms |
+| 30K | IVF 8 probes | 10.7s | 11.7ms | 32.3ms | find 1.5ms, rerank 9.8ms |
+| 30K | HNSW ef300/efc64 | 66.0s | 8.0ms | 8.8ms | find 7.4ms, rerank 0.5ms |
+| 100K | HNSW ef300/efc64 | 232.5s | 6.3ms | 7.3ms | find 5.8ms, rerank 0.4ms |
+| 300K | HNSW ef300/efc64 | 720.8s | 12.8ms | 18.7ms | find 12.0ms, rerank 0.7ms |
+| 1M | HNSW ef300/efc16 | 900.6s | 579.5ms | 966.6ms | find 577.9ms, rerank 1.4ms |
+
+Interpretation:
+- Filter enumeration is no longer the bottleneck (`enum` is ~0ms after the
+  first cached filter compile).
+- 100K broad-filter HNSW now matches the historical unfiltered latency range
+  (~6ms).
+- 1M HNSW does **not** match the earlier documented ~6ms unfiltered search
+  result in this run. The slowdown is inside raw HNSW candidate search, not
+  filter planning or reranking, and needs a separate HNSW-scale follow-up.
 
 ### Text search
 

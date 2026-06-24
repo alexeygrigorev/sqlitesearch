@@ -41,15 +41,28 @@ def load_data(n_vectors: int, n_queries: int) -> tuple[np.ndarray, np.ndarray]:
     t0 = time.perf_counter()
 
     pf = pq.ParquetFile(DATASET_DIR / "shuffle_train.parquet")
-    train_rows = []
+    train_embs = None
+    loaded = 0
     remaining = n_vectors
-    for batch in pf.iter_batches(batch_size=min(100_000, n_vectors), columns=["emb"]):
+    batch_size = min(50_000, n_vectors)
+    for batch in pf.iter_batches(batch_size=batch_size, columns=["emb"]):
         take = min(remaining, len(batch))
-        train_rows.extend(batch.column("emb")[:take].to_pylist())
+        values = batch.column("emb")[:take].to_pylist()
+        chunk = np.array(values, dtype=np.float32)
+        del values
+        if train_embs is None:
+            train_embs = np.empty((n_vectors, chunk.shape[1]), dtype=np.float32)
+        train_embs[loaded : loaded + len(chunk)] = chunk
+        loaded += len(chunk)
         remaining -= take
+        print(f"  loaded train {loaded:,}/{n_vectors:,}", flush=True)
         if remaining <= 0:
             break
-    train_embs = np.array(train_rows, dtype=np.float32)
+
+    if train_embs is None:
+        train_embs = np.empty((0, 0), dtype=np.float32)
+    elif loaded < n_vectors:
+        train_embs = train_embs[:loaded]
 
     test_table = pq.read_table(DATASET_DIR / "test.parquet", columns=["emb"])
     test_embs = np.array(test_table.column("emb").to_pylist(), dtype=np.float32)[:n_queries]
@@ -82,8 +95,8 @@ def run_mode(
     k: int,
     categories: int,
     broad_categories: int,
+    config: dict[str, Any],
 ) -> None:
-    config = DEFAULT_CONFIGS[mode]
     n_vectors = len(train_embs)
     db_path = f"/tmp/sqlitesearch_profile_filtered_{mode}_{n_vectors}.db"
     if os.path.exists(db_path):
@@ -93,6 +106,7 @@ def run_mode(
     filter_dict = {"category": [f"c{i}" for i in range(broad_categories)]}
 
     print(f"\nMode: {mode}", flush=True)
+    print("Building payload and index...", flush=True)
     index = VectorSearchIndex(
         mode=mode,
         keyword_fields=["category"],
@@ -147,10 +161,18 @@ def main() -> None:
     parser.add_argument("--modes", nargs="+", choices=sorted(DEFAULT_CONFIGS), default=["lsh", "ivf", "hnsw"])
     parser.add_argument("--categories", type=int, default=10)
     parser.add_argument("--broad-categories", type=int, default=7)
+    parser.add_argument("--hnsw-ef-construction", type=int, default=None)
+    parser.add_argument("--hnsw-ef-search", type=int, default=None)
     args = parser.parse_args()
 
     train_embs, test_embs = load_data(args.n_vectors, args.n_queries)
     for mode in args.modes:
+        config = DEFAULT_CONFIGS[mode].copy()
+        if mode == "hnsw":
+            if args.hnsw_ef_construction is not None:
+                config["ef_construction"] = args.hnsw_ef_construction
+            if args.hnsw_ef_search is not None:
+                config["ef_search"] = args.hnsw_ef_search
         run_mode(
             mode,
             train_embs,
@@ -158,6 +180,7 @@ def main() -> None:
             k=args.k,
             categories=args.categories,
             broad_categories=args.broad_categories,
+            config=config,
         )
 
 

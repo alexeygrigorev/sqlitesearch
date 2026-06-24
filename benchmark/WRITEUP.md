@@ -260,6 +260,49 @@ Even with 64 tables and 6 hash bits, recall@100 tops out at 0.82 with 6.5s laten
 
 At 1M with 768 dimensions, LSH with random projections reaches its limits. The top-100 nearest neighbors often have moderate cosine similarity (0.6-0.8), where the probability of landing in the same or nearby hash bucket is low even with multi-probe. Without multi-probe, getting competitive recall requires 64 tables and small hash sizes, which makes every query scan a large fraction of the dataset (6+ seconds per query, 8+ GB database).
 
+## Filtered vector search profile
+
+Filtered vector search uses a cardinality-aware planner:
+
+- selective filters (`<= 20,000` matching vectors) use exact cosine rerank over
+  the filtered subset, which fixes the old post-filter recall collapse;
+- broad filters use ANN candidates plus cached filter-id intersection;
+- broad HNSW filters bypass filter-aware traversal when the filter covers at
+  least half the graph, because normal HNSW already returns enough matching
+  candidates and avoids large-scale filtered-walk overhead.
+
+The focused profiler is:
+
+```bash
+uv run python benchmark/profile_filtered_search.py --n-vectors 30000 --n-queries 20
+uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 100000 --n-queries 20
+uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 300000 --n-queries 20
+uv run python benchmark/profile_filtered_search.py --modes hnsw --n-vectors 1000000 \
+  --n-queries 20 --hnsw-ef-construction 16 --hnsw-ef-search 300
+```
+
+Local results measured during this pass for a broad 70% keyword filter
+(`category IN c0..c6`):
+
+| N vectors | mode/config | build | avg lat | p99 lat | hot path |
+|--:|---|--:|--:|--:|---|
+| 30K | LSH 8t/16b/p2 | 4.6s | 71.9ms | 102.7ms | find 44.3ms, rerank 25.7ms |
+| 30K | IVF 8 probes | 10.7s | 11.7ms | 32.3ms | find 1.5ms, rerank 9.8ms |
+| 30K | HNSW ef300/efc64 | 66.0s | 8.0ms | 8.8ms | find 7.4ms, rerank 0.5ms |
+| 100K | HNSW ef300/efc64 | 232.5s | 6.3ms | 7.3ms | find 5.8ms, rerank 0.4ms |
+| 300K | HNSW ef300/efc64 | 720.8s | 12.8ms | 18.7ms | find 12.0ms, rerank 0.7ms |
+| 1M | HNSW ef300/efc16 | 900.6s | 579.5ms | 966.6ms | find 577.9ms, rerank 1.4ms |
+
+The 30K results show the filter-id cache and cached vector norms remove the
+original broad-filter SQL/rerank overhead. The 100K and 300K HNSW results are
+also in the expected low-millisecond range for broad filters.
+
+The 1M HNSW result does **not** reproduce the earlier documented ~6ms search
+latency. In this profiler run the cost is inside raw HNSW candidate search
+(`find_candidates`), not filter enumeration (`enum` is ~0ms after caching) or
+reranking. Treat this as an open HNSW-scale regression/follow-up rather than a
+filtered-planner issue.
+
 ---
 
 ## Vector search optimizations applied
@@ -273,7 +316,14 @@ At 1M with 768 dimensions, LSH with random projections reaches its limits. The t
 7. Vectorized cosine reranking — matrix multiply + `argpartition` for top-K
 8. Chunked IN-queries — avoids SQLite variable limit for large candidate sets
 9. Multi-probe candidate cap — limits reranking to top 50K candidates by table-hit count
+10. Cached filtered id sets — repeated filtered vector queries compile the
+    SQL filter once and reuse the matching vector ids for planning and
+    candidate intersection
+11. Cached vector norms — reranking uses cached vector norms instead of
+    normalizing candidate matrices per query
+12. Broad-filter HNSW bypass — filters covering at least half the graph use
+    normal HNSW plus cached-id intersection instead of filter-aware traversal
 
 ---
 
-All 124 tests pass after all optimizations (102 original + 11 IVF + 11 HNSW).
+The current test suite passed locally with 177 selected tests and 3 deselected.

@@ -32,6 +32,7 @@ from sqlitesearch.vector.strategy_lsh import LSHStrategy
 # Cardinality-aware filtering mirrors what Qdrant/Milvus/pgvector do: exact scan
 # for selective filters, filtered ANN otherwise.
 _DEFAULT_EXACT_FILTER_THRESHOLD = 20_000
+_DEFAULT_HNSW_BROAD_FILTER_RATIO = 0.5
 
 
 class VectorSearchIndex:
@@ -494,6 +495,18 @@ class VectorSearchIndex:
         knob, cap = self._ann_budget_knob_and_cap()
 
         if self._mode == VectorMode.HNSW:
+            n_nodes = getattr(self._strategy, "_n_nodes", 0) or 0
+            if n_nodes and len(filtered_ids) / n_nodes >= _DEFAULT_HNSW_BROAD_FILTER_RATIO:
+                return self._filtered_ann_search_by_intersection(
+                    cursor,
+                    query_vector,
+                    filtered_ids,
+                    num_results,
+                    output_ids,
+                    knob,
+                    cap,
+                )
+
             allowed = self._hnsw_filter_mask(cursor, filter_dict, filtered_ids)
             current = self._strategy.ef_search
             candidates: set[int] = set()
@@ -515,15 +528,28 @@ class VectorSearchIndex:
             return self._rerank(cursor, query_vector, candidates, num_results, output_ids)
 
         # LSH / IVF: widen the budget via override, then post-filter.
+        return self._filtered_ann_search_by_intersection(
+            cursor, query_vector, filtered_ids, num_results, output_ids, knob, cap
+        )
+
+    def _filtered_ann_search_by_intersection(
+        self,
+        cursor: sqlite3.Cursor,
+        query_vector: np.ndarray,
+        filtered_ids: set[int],
+        num_results: int,
+        output_ids: bool,
+        knob: str,
+        cap: int,
+    ) -> list[dict[str, Any]]:
+        """Run ANN normally, then intersect candidates with cached filter ids."""
         current = getattr(self._strategy, knob)
         survivors: set[int] = set()
         while True:
             candidate_ids = self._strategy.find_candidates(
                 cursor, query_vector, override={knob: current}
             )
-            survivors = self._apply_filters(
-                cursor, candidate_ids, filter_dict, allowed_ids=filtered_ids
-            )
+            survivors = candidate_ids & filtered_ids
             if len(survivors) >= num_results or current >= cap:
                 break
             nxt = min(current * 2, cap)
