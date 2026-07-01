@@ -8,7 +8,12 @@ sqlitesearch is a persistent sibling of [minsearch](https://github.com/alexeygri
 
 ```bash
 uv add sqlitesearch
+# or: pip install sqlitesearch
 ```
+
+Optional extras:
+
+- `sqlitesearch[libsql]` — back the index with libSQL / Turso Cloud (see [Storage backends](#storage-backends)).
 
 ## Text Search
 
@@ -117,15 +122,42 @@ results = index.search("python", output_ids=True)
 
 ## Vector Search
 
-Vector search supports three modes for approximate nearest neighbor search, all followed by exact cosine similarity reranking:
+Vector search supports four modes for approximate nearest neighbor search, all followed by exact cosine similarity reranking:
 
 | Mode | Best for | How it works |
 |------|----------|--------------|
-| **LSH** (default) | Up to 100K vectors | Random hyperplane projections + bucket lookup |
+| **HNSW** (default) | 10K-100K vectors | Hierarchical proximity graph traversal |
+| **LSH** | Up to 100K vectors | Random hyperplane projections + bucket lookup |
+| **LSH_INT8** | Up to 100K vectors, lower RAM | LSH + an int8-quantized, disk-backed shortlist cache (drops the float32 vector copy) |
 | **IVF** | 10K-100K vectors | K-means clustering + nearest-cluster probe |
-| **HNSW** | 10K-100K vectors | Hierarchical proximity graph traversal |
 
-### LSH (default)
+### HNSW (Hierarchical Navigable Small World) — default
+
+Builds a multi-layer proximity graph. Highest recall and fastest search, but slower to build. This is the default mode.
+
+```python
+index = VectorSearchIndex(
+    mode="hnsw",               # the default; shown for clarity
+    m=16,                   # Max connections per node (more = better recall)
+    ef_construction=200,    # Build-time beam width (more = better graph)
+    ef_search=50,           # Search-time beam width (more = better recall)
+    db_path="vectors.db"
+)
+```
+
+The layer-0 beam search is compiled with numba (a hard dependency, installed automatically), which cuts build time substantially at scale.
+
+For lower serving RAM, pass `disk_backed=True` to drop the float32 vector cache the index keeps by default and serve the graph-walk vectors from a file-backed memmap instead, so steady-state search RSS stays flat as the corpus grows (the OS can evict file-backed pages it can't evict anonymous RAM). Results are exact and unchanged:
+
+```python
+index = VectorSearchIndex(
+    mode="hnsw",
+    disk_backed=True,       # drop the vector cache; serve nav vectors from disk
+    db_path="vectors.db"
+)
+```
+
+### LSH
 
 Each vector is hashed into one bucket per table using random hyperplane projections. At query time, LSH looks up buckets matching the query's hash to find candidates, then reranks them by exact cosine similarity. By default, `n_probe=2` enables multi-probe lookup, so LSH also checks neighboring buckets that differ by 1 or 2 bits — this dramatically improves recall because similar vectors that landed in an adjacent bucket (due to one projection going the other way) are still found.
 
@@ -134,6 +166,7 @@ import numpy as np
 from sqlitesearch import VectorSearchIndex
 
 index = VectorSearchIndex(
+    mode="lsh",
     keyword_fields=["category"],
     n_tables=8,      # Number of hash tables (more = better recall)
     hash_size=16,    # Bits per hash (more = better precision)
@@ -149,6 +182,21 @@ query = np.random.rand(384)
 results = index.search(query)
 ```
 
+### LSH_INT8 (lower-RAM LSH)
+
+Identical algorithm and results to plain LSH, but instead of holding the full float32 vector matrix in RAM it keeps an int8-quantized, disk-backed copy of the normalized vectors. LSH narrows candidates to a shortlist with a cheap int8 dot product, then the final top-k is an exact float32 cosine rerank over the shortlist's SQLite BLOBs — so recall matches plain LSH, at roughly a quarter of the index RAM (the int8 cache is also file-backed, so the OS can evict its pages under memory pressure). Use it when the corpus is large and RSS matters more than a little search latency.
+
+```python
+index = VectorSearchIndex(
+    mode="lsh_int8",
+    keyword_fields=["category"],
+    n_tables=8,
+    hash_size=16,
+    n_probe=2,
+    db_path="vectors.db"
+)
+```
+
 ### IVF (Inverted File Index)
 
 Clusters vectors using k-means, then searches only the nearest clusters at query time. Good balance of build speed and recall.
@@ -158,20 +206,6 @@ index = VectorSearchIndex(
     mode="ivf",
     n_clusters=None,        # Auto-scales (sqrt(n), capped at 256)
     n_probe_clusters=8,     # Clusters to search (more = better recall, slower)
-    db_path="vectors.db"
-)
-```
-
-### HNSW (Hierarchical Navigable Small World)
-
-Builds a multi-layer proximity graph. Highest recall and fastest search, but slower to build.
-
-```python
-index = VectorSearchIndex(
-    mode="hnsw",
-    m=16,                   # Max connections per node (more = better recall)
-    ef_construction=200,    # Build-time beam width (more = better graph)
-    ef_search=50,           # Search-time beam width (more = better recall)
     db_path="vectors.db"
 )
 ```
@@ -298,7 +332,7 @@ Milvus, Elasticsearch/OpenSearch, or another disk/page-aware ANN system.
 | Vector recall@100 | 0.65 | 0.97 | 0.89 |
 
 Vector search uses an in-memory vector cache for reranking and ANN search
-structures. At 100K, recall (0.89 with default LSH, higher with tuned HNSW/LSH)
+structures. At 100K, recall (0.89 with LSH, higher with tuned HNSW/LSH)
 is competitive for local use. See [benchmark/WRITEUP.md](benchmark/WRITEUP.md)
 for full results and tuning notes.
 

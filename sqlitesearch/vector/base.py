@@ -11,6 +11,7 @@ import numpy as np
 
 class VectorMode(str, Enum):
     LSH = "lsh"
+    LSH_INT8 = "lsh_int8"
     IVF = "ivf"
     HNSW = "hnsw"
 

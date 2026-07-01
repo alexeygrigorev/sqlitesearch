@@ -22,7 +22,7 @@ release:
 
 # Manual publish (legacy) -- prefer `make release` (tag push -> CI publish).
 publish-build:
-	uv run hatch build
+	uv build
 
 publish-test:
 	uv run hatch publish --repo test

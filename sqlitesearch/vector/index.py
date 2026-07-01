@@ -1,8 +1,8 @@
 """
 VectorSearchIndex - Persistent vector search with pluggable strategies.
 
-Supports LSH, IVF, and HNSW modes for approximate nearest neighbor search,
-followed by exact cosine similarity reranking.
+Supports HNSW, LSH, LSH_INT8, and IVF modes for approximate nearest neighbor
+search, followed by exact cosine similarity reranking.
 """
 
 import json
@@ -39,10 +39,10 @@ class VectorSearchIndex:
     """
     A persistent vector search index with pluggable search strategies.
 
-    Supports mode="lsh" (default), mode="ivf", and mode="hnsw".
+    Supports mode="hnsw" (default), mode="lsh", mode="lsh_int8", and mode="ivf".
 
     API:
-    - __init__(mode="lsh", keyword_fields=None, numeric_fields=None, date_fields=None, id_field=None, db_path=..., **kwargs)
+    - __init__(mode="hnsw", keyword_fields=None, numeric_fields=None, date_fields=None, id_field=None, db_path=..., **kwargs)
     - fit(vectors, payload) - Index vectors (only if index is empty)
     - add(vector, doc) - Add a single vector with document
     - search(query_vector, filter_dict=None, num_results=10, output_ids=False)
@@ -50,7 +50,7 @@ class VectorSearchIndex:
 
     def __init__(
         self,
-        mode: str = "lsh",
+        mode: str = "hnsw",
         keyword_fields: list[str] | None = None,
         numeric_fields: list[str] | None = None,
         date_fields: list[str] | None = None,
@@ -71,6 +71,10 @@ class VectorSearchIndex:
         m: int = 16,
         ef_construction: int = 200,
         ef_search: int = 50,
+        # HNSW only: serve nav vectors from a disk-backed memmap and drop the
+        # index's float32 cache, trading a little search latency for flat
+        # steady-state RSS as the corpus grows. Ignored for other modes.
+        disk_backed: bool = False,
         # Filtered search: max filtered-subset size for the exact-scan branch.
         # None -> _DEFAULT_EXACT_FILTER_THRESHOLD. Set 0 to always use the ANN
         # path for filtered queries.
@@ -119,6 +123,12 @@ class VectorSearchIndex:
             self._strategy = LSHStrategy(
                 n_tables=n_tables, hash_size=hash_size, n_probe=n_probe, seed=seed
             )
+        elif mode_enum == VectorMode.LSH_INT8:
+            from sqlitesearch.vector.strategy_lsh_int8 import LSHInt8Strategy
+
+            self._strategy = LSHInt8Strategy(
+                n_tables=n_tables, hash_size=hash_size, n_probe=n_probe, seed=seed
+            )
         elif mode_enum == VectorMode.IVF:
             from sqlitesearch.vector.strategy_ivf import IVFStrategy
 
@@ -129,13 +139,18 @@ class VectorSearchIndex:
             from sqlitesearch.vector.strategy_hnsw import HNSWStrategy
 
             self._strategy = HNSWStrategy(
-                m=m, ef_construction=ef_construction, ef_search=ef_search, seed=seed
+                m=m,
+                ef_construction=ef_construction,
+                ef_search=ef_search,
+                seed=seed,
+                disk_backed=disk_backed,
             )
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
         # Let the strategy size its bulk inserts for the backend too (#13).
         self._strategy._max_vars = self._max_vars
+        self._cache_vectors_in_memory = not getattr(self._strategy, "use_sqlite_rerank", False)
 
         self._init_db()
 
@@ -270,7 +285,22 @@ class VectorSearchIndex:
                 f"number of payload documents ({len(payload)})"
             )
 
-        # Initialize dimension + strategy params if first time
+        # On a cold reopen of a NON-empty index, the in-memory state (dimension,
+        # strategy params, and for caching modes the vector cache) is empty even
+        # though the index on disk is not. Load the persisted state before the
+        # first-time check below: otherwise save_params() would overwrite the
+        # saved graph / projections / centroids with empty defaults, and
+        # add_to_index() would then rebuild from just the new chunk (clobbering
+        # everything fit previously). Same cold-load dance search() performs --
+        # but only when there is actually persisted state to reload. An empty
+        # index has nothing to reload, and querying the not-yet-synced schema of
+        # a fresh libsql embedded replica would raise "no such table".
+        if self._dimension is None and not self._is_empty():
+            self._load_metadata()
+            if self._cache_vectors_in_memory:
+                self._load_vector_cache()
+
+        # Initialize dimension + strategy params if first time (genuinely empty index)
         if self._dimension is None:
             self._dimension = vectors.shape[1]
             if hasattr(self._strategy, "set_dimension"):
@@ -348,32 +378,33 @@ class VectorSearchIndex:
 
         conn.commit()
 
-        # Update in-memory vector cache
-        new_norms = np.linalg.norm(vectors, axis=1).astype(np.float32)
-        new_norms = np.where(new_norms == 0, 1.0, new_norms)
-        new_docs = []
-        for doc_row in doc_rows:
-            doc = json.loads(doc_row[0])
-            doc = self._convert_dates(doc)
-            new_docs.append(doc)
+        if self._cache_vectors_in_memory:
+            # Update in-memory vector cache
+            new_norms = np.linalg.norm(vectors, axis=1).astype(np.float32)
+            new_norms = np.where(new_norms == 0, 1.0, new_norms)
+            new_docs = []
+            for doc_row in doc_rows:
+                doc = json.loads(doc_row[0])
+                doc = self._convert_dates(doc)
+                new_docs.append(doc)
 
-        if self._cached_vectors is None:
-            self._cached_vectors = vectors.copy()
-            self._cached_vector_norms = new_norms
-            self._cached_doc_ids = list(doc_ids)
-            self._cached_docs = new_docs
-            self._id_to_cache_idx = {did: i for i, did in enumerate(doc_ids)}
-        else:
-            offset = len(self._cached_doc_ids)
-            self._cached_vectors = np.vstack([self._cached_vectors, vectors])
-            self._cached_vector_norms = np.concatenate([
-                self._cached_vector_norms,
-                new_norms,
-            ])
-            self._cached_doc_ids.extend(doc_ids)
-            self._cached_docs.extend(new_docs)
-            for i, did in enumerate(doc_ids):
-                self._id_to_cache_idx[did] = offset + i
+            if self._cached_vectors is None:
+                self._cached_vectors = vectors.copy()
+                self._cached_vector_norms = new_norms
+                self._cached_doc_ids = list(doc_ids)
+                self._cached_docs = new_docs
+                self._id_to_cache_idx = {did: i for i, did in enumerate(doc_ids)}
+            else:
+                offset = len(self._cached_doc_ids)
+                self._cached_vectors = np.vstack([self._cached_vectors, vectors])
+                self._cached_vector_norms = np.concatenate([
+                    self._cached_vector_norms,
+                    new_norms,
+                ])
+                self._cached_doc_ids.extend(doc_ids)
+                self._cached_docs.extend(new_docs)
+                for i, did in enumerate(doc_ids):
+                    self._id_to_cache_idx[did] = offset + i
 
         self._filter_cache.clear()
         return self
@@ -426,7 +457,7 @@ class VectorSearchIndex:
         if self._dimension is None:
             return []
 
-        if self._cached_vectors is None:
+        if self._cache_vectors_in_memory and self._cached_vectors is None:
             self._load_vector_cache()
 
         if query_vector.shape[0] != self._dimension:
@@ -440,6 +471,18 @@ class VectorSearchIndex:
 
         # No filter: standard ANN path (unchanged, no planner overhead).
         if not filter_dict:
+            search_unfiltered = getattr(self._strategy, "search_unfiltered", None)
+            if search_unfiltered is not None:
+                results = search_unfiltered(
+                    cursor,
+                    query_vector,
+                    num_results,
+                    output_ids,
+                    self.id_field,
+                    self._convert_dates,
+                )
+                if results is not None:
+                    return results
             candidate_ids = self._strategy.find_candidates(cursor, query_vector)
             if not candidate_ids:
                 return []
@@ -797,6 +840,37 @@ class VectorSearchIndex:
         if not candidate_ids:
             return []
 
+        rank_candidate_ids = getattr(self._strategy, "rank_candidate_ids", None)
+        if rank_candidate_ids is not None and not self._cache_vectors_in_memory:
+            candidate_ids = rank_candidate_ids(
+                cursor,
+                query_vector,
+                candidate_ids,
+                num_results,
+            )
+            if not candidate_ids:
+                return []
+
+        rerank_sqlite_vector_rows = getattr(self._strategy, "rerank_sqlite_vector_rows", None)
+        if rerank_sqlite_vector_rows is not None and not self._cache_vectors_in_memory:
+            ids_list = list(candidate_ids)
+            rows = self._chunked_in_query(
+                cursor,
+                "SELECT id, vector_hash FROM docs "
+                "WHERE id IN ({placeholders}) AND vector_hash IS NOT NULL",
+                ids_list,
+            )
+            if not rows:
+                return []
+            top_ids = rerank_sqlite_vector_rows(
+                query_vector,
+                rows,
+                num_results,
+            )
+            if not top_ids:
+                return []
+            return self._fetch_docs_by_ids(cursor, top_ids, output_ids)
+
         if self._cached_vectors is not None and self._id_to_cache_idx is not None:
             cache_indices = [
                 self._id_to_cache_idx[did] for did in candidate_ids if did in self._id_to_cache_idx
@@ -813,9 +887,14 @@ class VectorSearchIndex:
             )
         else:
             ids_list = list(candidate_ids)
+            # Rerank query pulls only the vectors, NOT doc_json: at LSH scale a
+            # query can have thousands of candidates, and transferring every
+            # doc payload out of SQLite just to discard all but num_results of
+            # them dominates the no-cache latency. doc_json for the winners is
+            # fetched separately below via _fetch_docs_by_ids.
             rows = self._chunked_in_query(
                 cursor,
-                "SELECT id, doc_json, vector_hash FROM docs "
+                "SELECT id, vector_hash FROM docs "
                 "WHERE id IN ({placeholders}) AND vector_hash IS NOT NULL",
                 ids_list,
             )
@@ -823,9 +902,13 @@ class VectorSearchIndex:
                 return []
             cache_indices = None
             doc_ids_fb = [row["id"] for row in rows]
-            docs_fb = [self._convert_dates(json.loads(row["doc_json"])) for row in rows]
-            candidate_matrix = np.stack(
-                [np.frombuffer(row["vector_hash"], dtype=np.float32) for row in rows]
+            # Parse the float32 vectors in one shot: concatenate the raw BLOB
+            # bytes and reshape, instead of a per-row np.frombuffer + np.stack
+            # (a Python-level loop with one allocation per candidate).
+            blobs = [row["vector_hash"] for row in rows]
+            dim = len(blobs[0]) // 4
+            candidate_matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(
+                len(blobs), dim
             )
             candidate_norms = None
 
@@ -848,23 +931,44 @@ class VectorSearchIndex:
         else:
             top_indices = np.argsort(similarities)[::-1]
 
+        if cache_indices is None:
+            # No-cache path: the rerank only read vectors, so fetch doc_json for
+            # the (<=num_results) winners in one query that preserves order.
+            top_ids = [doc_ids_fb[idx] for idx in top_indices if similarities[idx] > 0]
+            return self._fetch_docs_by_ids(cursor, top_ids, output_ids)
+
         results = []
         for idx in top_indices:
             score = float(similarities[idx])
             if score > 0:
-                if cache_indices is not None:
-                    ci = cache_indices[idx]
-                    doc = self._cached_docs[ci].copy()
-                    doc_id = self._cached_doc_ids[ci]
-                else:
-                    doc = docs_fb[idx]
-                    doc_id = doc_ids_fb[idx]
+                ci = cache_indices[idx]
+                doc = self._cached_docs[ci].copy()
+                doc_id = self._cached_doc_ids[ci]
 
                 if output_ids:
                     result_id = doc.get(self.id_field, doc_id) if self.id_field else doc_id
                     doc = {**doc, "_id": result_id}
                 results.append(doc)
 
+        return results
+
+    def _fetch_docs_by_ids(self, cursor, doc_ids, output_ids):
+        rows = self._chunked_in_query(
+            cursor,
+            "SELECT id, doc_json FROM docs WHERE id IN ({placeholders})",
+            list(doc_ids),
+        )
+        docs_by_id = {row["id"]: row["doc_json"] for row in rows}
+        results = []
+        for doc_id in doc_ids:
+            doc_json = docs_by_id.get(doc_id)
+            if doc_json is None:
+                continue
+            doc = self._convert_dates(json.loads(doc_json))
+            if output_ids:
+                result_id = doc.get(self.id_field, doc_id) if self.id_field else doc_id
+                doc = {**doc, "_id": result_id}
+            results.append(doc)
         return results
 
     def _load_vector_cache(self) -> None:
@@ -950,6 +1054,9 @@ class VectorSearchIndex:
 
     def close(self) -> None:
         """Close the database connection."""
+        close_strategy = getattr(self._strategy, "close", None)
+        if close_strategy is not None:
+            close_strategy()
         if hasattr(self._local, "conn"):
             self._local.conn.close()
             delattr(self._local, "conn")

@@ -125,6 +125,7 @@ class TestVectorSearchIndexBasics:
         query = (base + 0.05 * rng.standard_normal(64, dtype=np.float32)).astype(np.float32)
 
         exact_bucket_index = VectorSearchIndex(
+            mode="lsh",
             n_tables=1,
             hash_size=16,
             n_probe=0,
@@ -137,6 +138,7 @@ class TestVectorSearchIndexBasics:
         os.unlink(temp_db)
 
         default_index = VectorSearchIndex(
+            mode="lsh",
             n_tables=1,
             hash_size=16,
             seed=42,

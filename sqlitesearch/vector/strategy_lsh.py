@@ -69,6 +69,20 @@ class LSHStrategy:
         self._generate_random_vectors(dimension)
 
     def build_index(self, cursor: sqlite3.Cursor, vectors: np.ndarray, doc_ids: list[int]) -> None:
+        self._insert_lsh_buckets(cursor, vectors, doc_ids)
+
+    def add_to_index(self, cursor: sqlite3.Cursor, vectors: np.ndarray, doc_ids: list[int]) -> None:
+        # Same as build_index for LSH
+        self._insert_lsh_buckets(cursor, vectors, doc_ids)
+
+    def _insert_lsh_buckets(
+        self, cursor: sqlite3.Cursor, vectors: np.ndarray, doc_ids: list[int]
+    ) -> None:
+        """Hash ``vectors`` and bulk-insert their (table_id, hash_key, doc_id) rows.
+
+        Split out from build_index so the int8-cache LSH variants can insert just
+        the new buckets during add() without rebuilding their quantized cache.
+        """
         all_signs = self._hash_vectors_batch(vectors)
         lsh_rows = []
         for i, doc_id in enumerate(doc_ids):
@@ -79,10 +93,6 @@ class LSHStrategy:
             cursor, "lsh_buckets", ["table_id", "hash_key", "doc_id"], lsh_rows,
             max_vars=getattr(self, "_max_vars", _MAX_SQL_VARS),
         )
-
-    def add_to_index(self, cursor: sqlite3.Cursor, vectors: np.ndarray, doc_ids: list[int]) -> None:
-        # Same as build_index for LSH
-        self.build_index(cursor, vectors, doc_ids)
 
     def find_candidates(
         self,

@@ -9,14 +9,30 @@ NN-descent refinement pass improves graph quality by checking 2-hop neighbors.
 
 import heapq
 import math
+import os
 import pickle
 import sqlite3
+import tempfile
 
 import numpy as np
 
+try:
+    from sqlitesearch.vector._hnsw_numba import beam_search_0 as _beam_search_0_njit
+except ImportError:  # numba not installed
+    _beam_search_0_njit = None
+
 
 class HNSWStrategy:
-    """HNSW search strategy using a hierarchical proximity graph."""
+    """HNSW search strategy using a hierarchical proximity graph.
+
+    By default the index keeps a float32 vector cache (``_cached_vectors``) and
+    the strategy holds the normalized nav vectors it walks resident in RAM --
+    simple and fast. Pass ``disk_backed=True`` for a lower-RAM profile: the
+    index drops its cache and the strategy spills/rebuilds its nav vectors into
+    a file-backed memmap, letting the OS evict pages under pressure. Exact
+    results are unchanged because ``index.py._rerank`` reranks the small
+    candidate set straight from SQLite BLOBs.
+    """
 
     def __init__(
         self,
@@ -24,12 +40,17 @@ class HNSWStrategy:
         ef_construction: int = 64,
         ef_search: int = 200,
         seed: int | None = None,
+        disk_backed: bool = False,
     ):
         self.m = m
         self.m_max0 = m * 2  # max connections at layer 0
         self.ef_construction = ef_construction
         self.ef_search = ef_search
         self._seed = seed
+        # When True, the index drops its float32 cache (see ``use_sqlite_rerank``)
+        # and this strategy serves nav vectors from a disk-backed memmap instead
+        # of a resident array.
+        self._disk_backed = disk_backed
 
         self._dimension: int | None = None
         self._entry_point: int | None = None
@@ -51,6 +72,27 @@ class HNSWStrategy:
         self._doc_ids: list[int] | None = None
         self._id_to_idx: dict[int, int] | None = None
         self._n_nodes: int = 0
+
+        # Reusable heap buffers for the numba layer-0 beam search during build
+        # (allocated once in build_index, mirroring the pre-allocated
+        # visited_gen array). None when numba is unavailable -> numpy fallback.
+        self._cand_sim: np.ndarray | None = None
+        self._cand_idx: np.ndarray | None = None
+        self._res_sim: np.ndarray | None = None
+        self._res_idx: np.ndarray | None = None
+
+        # Disk-backed nav vectors: after construction the normalized layer-0
+        # vectors are spilled to a memmap so steady-state search RSS stays flat
+        # as the corpus grows (the OS can evict file-backed pages it can't
+        # evict anonymous RAM). None until a memmap is opened.
+        self._vec_mmap_path: str | None = None
+
+    @property
+    def use_sqlite_rerank(self) -> bool:
+        # ``index.py`` drops ``_cached_vectors`` when this is True, so tying it to
+        # ``disk_backed`` keeps the two behaviors in sync: a disk-backed index
+        # reranks from SQLite BLOBs and never holds a second corpus copy.
+        return self._disk_backed
 
     def init_tables(self, cursor: sqlite3.Cursor) -> None:
         cursor.execute("""
@@ -133,6 +175,13 @@ class HNSWStrategy:
         # Overflow buffer for reverse edges — pruned when full during insertion
         overflow = 16
         adj_width = self.m_max0 + overflow
+        # Reusable heap buffers for the numba beam search (one allocation for
+        # the whole build, instead of per-node arrays).
+        if _beam_search_0_njit is not None and n > 0:
+            self._cand_sim = np.empty(n, dtype=np.float32)
+            self._cand_idx = np.empty(n, dtype=np.int64)
+            self._res_sim = np.empty(n, dtype=np.float32)
+            self._res_idx = np.empty(n, dtype=np.int64)
         self._adj = np.full((n, adj_width), -1, dtype=np.int32)
         self._adj_count = np.zeros(n, dtype=np.int32)
         self._capacity = n
@@ -172,6 +221,14 @@ class HNSWStrategy:
 
         if not self._graph_loaded:
             self._load_graph(cursor)
+
+        # On a cold reopen the nav vectors may not be resident (disk_backed
+        # drops the index cache; the resident profile is synced from the cache
+        # in VectorSearchIndex._load_vector_cache -> _sync_vectors_to_strategy).
+        # Rebuild them from the docs table before appending so _insert_node can
+        # navigate the existing graph and ``_vectors`` spans all existing nodes.
+        if self._vectors is None and self._n_nodes:
+            self._load_vectors_from_docs(cursor)
 
         normed_new = self._normalize(vectors)
         if self._vectors is not None:
@@ -224,6 +281,20 @@ class HNSWStrategy:
         if not self._graph_loaded:
             self._load_graph(cursor)
 
+        # Only the disk-backed profile manages nav vectors here. In the default
+        # (resident) profile the index caches vectors and syncs them into
+        # ``self._vectors`` (built during construction / reloaded by
+        # ``_sync_vectors_to_strategy``), so there is nothing to spill. The
+        # disk-backed profile drops that cache, so on a cold reopen it must
+        # rebuild nav vectors from the docs table, and after an in-process build
+        # it spills the resident array into a memmap once so steady-state search
+        # RSS stays flat as N grows.
+        if self._disk_backed:
+            if self._vectors is None and self._n_nodes:
+                self._load_vectors_from_docs(cursor)
+            else:
+                self._spill_vectors_to_mmap()
+
         query_normed = query_vector / (np.linalg.norm(query_vector) + 1e-10)
         vecs = self._vectors
 
@@ -254,6 +325,7 @@ class HNSWStrategy:
     def clear_index(self, cursor: sqlite3.Cursor) -> None:
         cursor.execute("DELETE FROM hnsw_edges")
         cursor.execute("DELETE FROM hnsw_meta")
+        self._cleanup_vec_mmap()
         self._adj = None
         self._adj_count = None
         self._capacity = 0
@@ -267,6 +339,83 @@ class HNSWStrategy:
         self._id_to_idx = None
         self._graph_loaded = False
         self._n_nodes = 0
+
+    # --- Disk-backed nav vectors ---
+
+    def _load_vectors_from_docs(self, cursor: sqlite3.Cursor) -> None:
+        """Rebuild the normalized nav vectors from the docs table (cold reopen).
+
+        The index does not hold a float32 vector cache (``use_sqlite_rerank``),
+        so on a cold load the graph-walk vectors must be reconstructed here
+        before the first search. They are written straight into a memmap so the
+        cold path lands in the same file-backed, evictable state as a spilled
+        in-process build.
+        """
+        cursor.execute(
+            "SELECT id, vector_hash FROM docs WHERE vector_hash IS NOT NULL ORDER BY id"
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return
+        self._doc_ids = [row["id"] for row in rows]
+        self._id_to_idx = {did: i for i, did in enumerate(self._doc_ids)}
+        blobs = [row["vector_hash"] for row in rows]
+        dim = len(blobs[0]) // 4  # float32
+        self._vectors = self._open_vec_mmap((len(blobs), dim))
+        chunk_size = 8192
+        for start in range(0, len(blobs), chunk_size):
+            block = np.stack([
+                np.frombuffer(b, dtype=np.float32)
+                for b in blobs[start : start + chunk_size]
+            ])
+            self._vectors[start : start + len(block)] = self._normalize(block)
+        self._vectors.flush()
+
+    def _spill_vectors_to_mmap(self) -> None:
+        """Move the resident nav-vector array (built during construction) onto a
+        disk-backed memmap once, so steady-state search RSS stays flat with N."""
+        vecs = self._vectors
+        if vecs is None or isinstance(vecs, np.memmap):
+            return
+        out = self._open_vec_mmap(vecs.shape)
+        chunk_size = 8192
+        for start in range(0, len(vecs), chunk_size):
+            block = vecs[start : start + chunk_size]
+            out[start : start + len(block)] = block  # already normalized
+        out.flush()
+        self._vectors = out
+
+    def _open_vec_mmap(self, shape) -> np.memmap:
+        self._cleanup_vec_mmap()
+        fd, path = tempfile.mkstemp(prefix="sqlitesearch-hnsw-", suffix=".nvec")
+        os.close(fd)
+        self._vec_mmap_path = path
+        return np.memmap(path, dtype=np.float32, mode="w+", shape=shape)
+
+    def _cleanup_vec_mmap(self) -> None:
+        path = self._vec_mmap_path
+        self._vec_mmap_path = None
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        # Drop the reference to the (possibly memmap-backed) nav vectors and
+        # remove the backing tempfile. The graph itself is persisted in SQLite.
+        self._vectors = None
+        self._cleanup_vec_mmap()
+
+    def __del__(self) -> None:
+        # close()/clear_index() are the intended cleanup path, but the memmap
+        # tempfile must not outlive an abandoned index (np.memmap flushes on
+        # collection but does not unlink its file). Best-effort; safe if
+        # __init__ raised before _vec_mmap_path was set or close() already ran.
+        try:
+            self._cleanup_vec_mmap()
+        except Exception:
+            pass
 
     # --- Array management ---
 
@@ -373,9 +522,17 @@ class HNSWStrategy:
         centers = vecs[indices].copy()
 
         for _ in range(max_iter):
-            # Assign: batch matmul
-            sims = vecs @ centers.T  # (n, k)
-            assignments = np.argmax(sims, axis=1)
+            # Assign: argmax over cosine to each centroid, computed in row
+            # chunks so the (n, k) similarity matrix is never materialized in
+            # full. At 1M x 256 clusters that matrix is ~1 GB; chunking caps the
+            # transient at (chunk, k) and keeps the HNSW build under the memory
+            # ceiling without changing the result.
+            assignments = np.empty(n, dtype=np.intp)
+            chunk = 65536
+            centers_T = centers.T
+            for start in range(0, n, chunk):
+                block = vecs[start : start + chunk]
+                assignments[start : start + len(block)] = np.argmax(block @ centers_T, axis=1)
 
             # Update centroids
             new_centers = np.zeros_like(centers)
@@ -619,9 +776,36 @@ class HNSWStrategy:
         self, q_vec: np.ndarray, entry: int, ef: int, vecs: np.ndarray,
         visited_gen: np.ndarray, gen: int,
     ) -> list[tuple[float, int]]:
-        """Beam search on layer 0 using pre-allocated visited generation counter."""
+        """Beam search on layer 0 using pre-allocated visited generation counter.
+
+        Uses the numba-compiled kernel (``_hnsw_numba.beam_search_0``) when
+        available and the reusable heap buffers are allocated; otherwise falls
+        back to the numpy implementation below.
+        """
+        if (
+            _beam_search_0_njit is not None
+            and self._cand_sim is not None
+            and self._adj is not None
+        ):
+            res_size = _beam_search_0_njit(
+                q_vec, vecs, self._adj, self._adj_count, entry, ef,
+                visited_gen, gen, self._cand_sim, self._cand_idx,
+                self._res_sim, self._res_idx,
+            )
+            return [(float(self._res_sim[i]), int(self._res_idx[i])) for i in range(res_size)]
+        return self._beam_search_0_gen_numpy(q_vec, entry, ef, vecs, visited_gen, gen)
+
+    def _beam_search_0_gen_numpy(
+        self, q_vec: np.ndarray, entry: int, ef: int, vecs: np.ndarray,
+        visited_gen: np.ndarray, gen: int,
+    ) -> list[tuple[float, int]]:
+        """Numpy beam search on layer 0 (fallback when numba is unavailable)."""
         adj = self._adj
         adj_count = self._adj_count
+        # Bind heapq ops as locals: this loop runs once per frontier pop,
+        # millions of times during build, so the attribute lookups add up.
+        heappush = heapq.heappush
+        heappop = heapq.heappop
 
         entry_sim = float(q_vec @ vecs[entry])
         visited_gen[entry] = gen
@@ -631,7 +815,7 @@ class HNSWStrategy:
         worst_sim = entry_sim
 
         while candidates:
-            neg_sim, current = heapq.heappop(candidates)
+            neg_sim, current = heappop(candidates)
             current_sim = -neg_sim
 
             if current_sim < worst_sim and len(results) >= ef:
@@ -646,25 +830,30 @@ class HNSWStrategy:
             # Filter visited using generation counter (no allocation!)
             new_mask = visited_gen[nbrs] != gen
             new_nbrs = nbrs[new_mask]
-            if len(new_nbrs) == 0:
+            if new_nbrs.size == 0:
                 continue
             visited_gen[new_nbrs] = gen
 
             sims = vecs[new_nbrs] @ q_vec
+            # Materialize as Python lists once: the tight heap loop below runs
+            # per neighbor, and indexing Python lists avoids boxing a numpy
+            # scalar (float()/int()) on every iteration.
+            nbrs_list = new_nbrs.tolist()
+            sims_list = sims.tolist()
+            n_new = len(nbrs_list)
 
             if len(results) >= ef:
-                good = sims > worst_sim
-                good_idx = np.where(good)[0]
+                good_idx = [i for i in range(n_new) if sims_list[i] > worst_sim]
             else:
-                good_idx = np.arange(len(new_nbrs))
+                good_idx = range(n_new)
 
             for i in good_idx:
-                sim_f = float(sims[i])
-                nbr = int(new_nbrs[i])
-                heapq.heappush(candidates, (-sim_f, nbr))
-                heapq.heappush(results, (sim_f, nbr))
+                sim_f = sims_list[i]
+                nbr = nbrs_list[i]
+                heappush(candidates, (-sim_f, nbr))
+                heappush(results, (sim_f, nbr))
                 if len(results) > ef:
-                    heapq.heappop(results)
+                    heappop(results)
                 worst_sim = results[0][0]
 
         results.sort(reverse=True)
