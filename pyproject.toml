@@ -77,13 +77,3 @@ addopts = "-m 'not integration'"
 markers = [
     "integration: real-Docker integration tests against a libsql-server (sqld) container; run with -m integration, skipped by default and when Docker is unavailable",
 ]
-
-[tool.uv]
-exclude-newer = "7 days"
-
-# stemlite is a sibling library (consolidated stemmers for minsearch /
-# zerosearch / sqlitesearch) not yet on PyPI. Resolve it from the local
-# checkout for development; this source is dev-only and stripped from the
-# published wheel metadata (end users get stemlite from PyPI).
-[tool.uv.sources]
-stemlite = { path = "../stemlite" }
