@@ -4,8 +4,8 @@ Tokenizer module for text processing.
 A custom tokenizer that splits text into tokens and removes stop words.
 Follows the same interface as minsearch.Tokenizer for compatibility.
 
-Stemming example with minsearch (optional dependency):
-    from minsearch.stemmers import porter_stemmer
+Stemming example with stemlite (optional dependency):
+    from stemlite import porter_stemmer
     tokenizer = Tokenizer(stop_words='english', stemmer=porter_stemmer)
 """
 
@@ -48,11 +48,15 @@ class Tokenizer:
         >>> tokenizer.tokenize("the quick brown fox")
         ['the', 'quick', 'brown', 'fox']
 
-        Stemming with minsearch (pip install minsearch):
-        >>> from minsearch.stemmers import porter_stemmer
+        Stemming with stemlite (pip install stemlite):
+        >>> from stemlite import porter_stemmer
         >>> tokenizer = Tokenizer(stop_words='english', stemmer=porter_stemmer)
         >>> tokenizer.tokenize("the runners are running quickly")
-        ['runner', 'run', 'quickli']
+        ['runner', 'run', 'quickly']
+
+        Or pick a stemmer by name via stemlite.get_stemmer:
+        >>> from stemlite import get_stemmer
+        >>> tokenizer = Tokenizer(stop_words='english', stemmer=get_stemmer('porter'))
     """
 
     def __init__(
@@ -72,8 +76,9 @@ class Tokenizer:
                 - set[str]: Custom set of stop words
             stemmer: Optional callable that stems a word (word -> stemmed_word).
                 Any function with signature str -> str works. For convenience,
-                minsearch provides porter_stemmer, snowball_stemmer, and
-                lancaster_stemmer that are directly compatible.
+                the optional ``stemlite`` package provides porter_stemmer,
+                snowball_stemmer, and lancaster_stemmer (and get_stemmer(name))
+                that are directly compatible.
         """
         self.pattern = re.compile(pattern)
 

@@ -34,6 +34,11 @@ dependencies = [
 libsql = [
     "libsql>=0.1.0",
 ]
+# Optional stemming support: ready-made Porter/Snowball/Lancaster stemmers to
+# pass as Tokenizer(stemmer=...). Not required -- any callable(str) -> str works.
+stemming = [
+    "stemlite>=0.1.0",
+]
 
 [dependency-groups]
 dev = [
@@ -43,6 +48,7 @@ dev = [
     "ruff>=0.5.0",
     "requests",
     "minsearch>=0.0.10",
+    "stemlite>=0.1.0",
     "pyarrow>=23.0.1",
     "s3fs>=2026.2.0",
     "libsql>=0.1.0",
@@ -74,3 +80,10 @@ markers = [
 
 [tool.uv]
 exclude-newer = "7 days"
+
+# stemlite is a sibling library (consolidated stemmers for minsearch /
+# zerosearch / sqlitesearch) not yet on PyPI. Resolve it from the local
+# checkout for development; this source is dev-only and stripped from the
+# published wheel metadata (end users get stemlite from PyPI).
+[tool.uv.sources]
+stemlite = { path = "../stemlite" }

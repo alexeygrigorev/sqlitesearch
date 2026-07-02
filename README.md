@@ -98,14 +98,28 @@ index = TextSearchIndex(
 )
 
 # Custom tokenizer: custom stop words + custom stemmer (any callable(str) -> str)
-from minsearch.stemmers import porter_stemmer  # pip install minsearch
+from stemlite import porter_stemmer  # pip install "sqlitesearch[stemming]"
 
 index = TextSearchIndex(
     text_fields=["title", "description"],
     tokenizer=Tokenizer(stop_words={"custom", "words"}, stemmer=porter_stemmer),
     db_path="search.db"
 )
+
+# Or pick a stemmer by name (porter / snowball / lancaster) via get_stemmer:
+from stemlite import get_stemmer
+
+index = TextSearchIndex(
+    text_fields=["title", "description"],
+    tokenizer=Tokenizer(stop_words="english", stemmer=get_stemmer("snowball")),
+    db_path="search.db"
+)
 ```
+
+The Python-side `stemmer` is any `callable(str) -> str`; the optional
+[stemlite](https://github.com/alexeygrigorev/stemlite) package provides
+ready-made Porter, Snowball, and Lancaster stemmers. Install it with the
+`stemming` extra: `pip install "sqlitesearch[stemming]"`.
 
 ### Custom ID Field
 

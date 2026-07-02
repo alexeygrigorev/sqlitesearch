@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from sqlitesearch import TextSearchIndex
+from sqlitesearch import TextSearchIndex, Tokenizer
 
 
 @pytest.fixture
@@ -545,3 +545,41 @@ class TestTextSearchIndexFilterCombinations:
         results = index.search("python", filter_dict={"nonexistent": "value"})
         # Should still return results because filter is ignored
         assert len(results) >= 1
+
+
+class TestStemliteStemmer:
+    """The Tokenizer accepts any callable(str) -> str stemmer; the optional
+    stemlite package provides ready-made ones. These tests document that
+    integration."""
+
+    def test_porter_stemmer_callable(self):
+        """A stemlite porter_stemmer works as a Tokenizer stemmer."""
+        stemlite = pytest.importorskip("stemlite")
+        tokenizer = Tokenizer(stop_words="english", stemmer=stemlite.porter_stemmer)
+        assert tokenizer.tokenize("the runners are running quickly") == [
+            "runner",
+            "run",
+            "quickly",
+        ]
+
+    def test_get_stemmer_by_name(self):
+        """stemlite.get_stemmer('porter') returns a compatible callable."""
+        stemlite = pytest.importorskip("stemlite")
+        tokenizer = Tokenizer(stemmer=stemlite.get_stemmer("porter"))
+        assert tokenizer.tokenize("courses") == ["cours"]
+
+    def test_stemmer_improves_recall(self, temp_db):
+        """A stemlite-stemmed query matches morphological variants in the index."""
+        stemlite = pytest.importorskip("stemlite")
+        tokenizer = Tokenizer(stop_words="english", stemmer=stemlite.porter_stemmer)
+        index = TextSearchIndex(
+            text_fields=["title"],
+            db_path=temp_db,
+            stemming=True,  # FTS5-side porter so index tokens match stemmed query
+            tokenizer=tokenizer,
+        )
+        index.fit([{"title": "The runner runs every morning"}])
+
+        # Query uses a different surface form ("running") than the doc.
+        results = index.search("running")
+        assert len(results) == 1
